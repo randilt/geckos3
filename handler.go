@@ -1,0 +1,282 @@
+package main
+
+import (
+	"encoding/xml"
+	"io"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+)
+
+type S3Handler struct {
+	storage *FilesystemStorage
+	auth    Authenticator
+}
+
+func NewS3Handler(storage *FilesystemStorage, auth Authenticator) *S3Handler {
+	return &S3Handler{
+		storage: storage,
+		auth:    auth,
+	}
+}
+
+func (h *S3Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Authenticate request
+	if err := h.auth.Authenticate(r); err != nil {
+		h.writeError(w, "AccessDenied", err.Error(), http.StatusForbidden)
+		return
+	}
+
+	// Parse bucket and key from path
+	bucket, key := h.parsePath(r.URL.Path)
+
+	// Route based on method and path
+	if bucket == "" {
+		// Service operations (not implemented)
+		h.writeError(w, "NotImplemented", "Service operations not supported", http.StatusNotImplemented)
+		return
+	}
+
+	if key == "" {
+		// Bucket operations
+		h.handleBucketOperation(w, r, bucket)
+	} else {
+		// Object operations
+		h.handleObjectOperation(w, r, bucket, key)
+	}
+}
+
+func (h *S3Handler) handleBucketOperation(w http.ResponseWriter, r *http.Request, bucket string) {
+	switch r.Method {
+	case http.MethodPut:
+		h.handleCreateBucket(w, r, bucket)
+	case http.MethodDelete:
+		h.handleDeleteBucket(w, r, bucket)
+	case http.MethodHead:
+		h.handleHeadBucket(w, r, bucket)
+	case http.MethodGet:
+		// Check if this is ListObjects
+		if r.URL.Query().Get("list-type") == "2" {
+			h.handleListObjectsV2(w, r, bucket)
+		} else {
+			h.writeError(w, "NotImplemented", "ListObjectsV1 not supported", http.StatusNotImplemented)
+		}
+	default:
+		h.writeError(w, "MethodNotAllowed", "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (h *S3Handler) handleObjectOperation(w http.ResponseWriter, r *http.Request, bucket, key string) {
+	switch r.Method {
+	case http.MethodPut:
+		h.handlePutObject(w, r, bucket, key)
+	case http.MethodGet:
+		h.handleGetObject(w, r, bucket, key)
+	case http.MethodHead:
+		h.handleHeadObject(w, r, bucket, key)
+	case http.MethodDelete:
+		h.handleDeleteObject(w, r, bucket, key)
+	default:
+		h.writeError(w, "MethodNotAllowed", "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// Bucket handlers
+func (h *S3Handler) handleCreateBucket(w http.ResponseWriter, r *http.Request, bucket string) {
+	if err := h.storage.CreateBucket(bucket); err != nil {
+		h.writeError(w, "InternalError", err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Location", "/"+bucket)
+	w.WriteHeader(http.StatusOK)
+}
+
+func (h *S3Handler) handleDeleteBucket(w http.ResponseWriter, r *http.Request, bucket string) {
+	if !h.storage.BucketExists(bucket) {
+		h.writeError(w, "NoSuchBucket", "The specified bucket does not exist", http.StatusNotFound)
+		return
+	}
+
+	if err := h.storage.DeleteBucket(bucket); err != nil {
+		h.writeError(w, "BucketNotEmpty", "The bucket you tried to delete is not empty", http.StatusConflict)
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *S3Handler) handleHeadBucket(w http.ResponseWriter, r *http.Request, bucket string) {
+	if !h.storage.BucketExists(bucket) {
+		h.writeError(w, "NoSuchBucket", "The specified bucket does not exist", http.StatusNotFound)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+}
+
+func (h *S3Handler) handleListObjectsV2(w http.ResponseWriter, r *http.Request, bucket string) {
+	if !h.storage.BucketExists(bucket) {
+		h.writeError(w, "NoSuchBucket", "The specified bucket does not exist", http.StatusNotFound)
+		return
+	}
+
+	// Parse query parameters
+	prefix := r.URL.Query().Get("prefix")
+	maxKeys := 1000
+	if mk := r.URL.Query().Get("max-keys"); mk != "" {
+		if parsed, err := strconv.Atoi(mk); err == nil && parsed > 0 {
+			maxKeys = parsed
+		}
+	}
+
+	objects, err := h.storage.ListObjects(bucket, prefix, maxKeys)
+	if err != nil {
+		h.writeError(w, "InternalError", err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Build XML response
+	response := ListBucketResult{
+		Xmlns:          "http://s3.amazonaws.com/doc/2006-03-01/",
+		Name:           bucket,
+		Prefix:         prefix,
+		MaxKeys:        maxKeys,
+		IsTruncated:    false,
+		KeyCount:       len(objects),
+		Contents:       make([]Object, len(objects)),
+	}
+
+	for i, obj := range objects {
+		response.Contents[i] = Object{
+			Key:          obj.Key,
+			LastModified: obj.LastModified.Format(time.RFC3339),
+			ETag:         obj.ETag,
+			Size:         obj.Size,
+			StorageClass: "STANDARD",
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/xml")
+	w.WriteHeader(http.StatusOK)
+	
+	xml.NewEncoder(w).Encode(response)
+}
+
+// Object handlers
+func (h *S3Handler) handlePutObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
+	if !h.storage.BucketExists(bucket) {
+		h.writeError(w, "NoSuchBucket", "The specified bucket does not exist", http.StatusNotFound)
+		return
+	}
+
+	metadata, err := h.storage.PutObject(bucket, key, r.Body)
+	if err != nil {
+		h.writeError(w, "InternalError", err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("ETag", metadata.ETag)
+	w.WriteHeader(http.StatusOK)
+}
+
+func (h *S3Handler) handleGetObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
+	reader, metadata, err := h.storage.GetObject(bucket, key)
+	if err != nil {
+		h.writeError(w, "NoSuchKey", "The specified key does not exist", http.StatusNotFound)
+		return
+	}
+	defer reader.Close()
+
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Length", strconv.FormatInt(metadata.Size, 10))
+	w.Header().Set("Last-Modified", metadata.LastModified.Format(http.TimeFormat))
+	w.Header().Set("ETag", metadata.ETag)
+	w.Header().Set("Accept-Ranges", "bytes")
+
+	w.WriteHeader(http.StatusOK)
+	io.Copy(w, reader)
+}
+
+func (h *S3Handler) handleHeadObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
+	metadata, err := h.storage.HeadObject(bucket, key)
+	if err != nil {
+		h.writeError(w, "NoSuchKey", "The specified key does not exist", http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Length", strconv.FormatInt(metadata.Size, 10))
+	w.Header().Set("Last-Modified", metadata.LastModified.Format(http.TimeFormat))
+	w.Header().Set("ETag", metadata.ETag)
+	w.Header().Set("Accept-Ranges", "bytes")
+
+	w.WriteHeader(http.StatusOK)
+}
+
+func (h *S3Handler) handleDeleteObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
+	if err := h.storage.DeleteObject(bucket, key); err != nil {
+		h.writeError(w, "InternalError", err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// Helper functions
+func (h *S3Handler) parsePath(path string) (bucket, key string) {
+	// Remove leading slash
+	path = strings.TrimPrefix(path, "/")
+	
+	if path == "" {
+		return "", ""
+	}
+
+	parts := strings.SplitN(path, "/", 2)
+	bucket = parts[0]
+	
+	if len(parts) > 1 {
+		key = parts[1]
+	}
+
+	return bucket, key
+}
+
+func (h *S3Handler) writeError(w http.ResponseWriter, code, message string, status int) {
+	errorResponse := ErrorResponse{
+		Code:    code,
+		Message: message,
+	}
+
+	w.Header().Set("Content-Type", "application/xml")
+	w.WriteHeader(status)
+	xml.NewEncoder(w).Encode(errorResponse)
+}
+
+// XML response structures
+type ListBucketResult struct {
+	XMLName     xml.Name `xml:"ListBucketResult"`
+	Xmlns       string   `xml:"xmlns,attr"`
+	Name        string   `xml:"Name"`
+	Prefix      string   `xml:"Prefix"`
+	MaxKeys     int      `xml:"MaxKeys"`
+	IsTruncated bool     `xml:"IsTruncated"`
+	KeyCount    int      `xml:"KeyCount"`
+	Contents    []Object `xml:"Contents"`
+}
+
+type Object struct {
+	Key          string `xml:"Key"`
+	LastModified string `xml:"LastModified"`
+	ETag         string `xml:"ETag"`
+	Size         int64  `xml:"Size"`
+	StorageClass string `xml:"StorageClass"`
+}
+
+type ErrorResponse struct {
+	XMLName xml.Name `xml:"Error"`
+	Code    string   `xml:"Code"`
+	Message string   `xml:"Message"`
+}
+
