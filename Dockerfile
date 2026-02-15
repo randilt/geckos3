@@ -27,12 +27,15 @@ VOLUME ["/data"]
 # Expose port
 EXPOSE 9000
 
-# Default configuration
-ENV GECKOS3_DATA_DIR=/data
-ENV GECKOS3_LISTEN=:9000
-ENV GECKOS3_ACCESS_KEY=geckoadmin
-ENV GECKOS3_SECRET_KEY=geckoadmin
-ENV GECKOS3_AUTH_ENABLED=true
+# Default configuration (overridable at runtime)
+# Use -e flag or docker-compose environment to set:
+#   GECKOS3_DATA_DIR (default: ./data)
+#   GECKOS3_LISTEN (default: :9000)
+#   GECKOS3_ACCESS_KEY (default: geckoadmin)
+#   GECKOS3_SECRET_KEY (default: geckoadmin)
+#   GECKOS3_AUTH_ENABLED (default: true)
+ENV GECKOS3_DATA_DIR=/data \
+    GECKOS3_LISTEN=:9000
 
 # Run server
 CMD ["./geckos3"]
