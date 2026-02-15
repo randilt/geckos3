@@ -53,7 +53,7 @@ func TestDeleteNonEmptyBucketFails(t *testing.T) {
 	defer cleanup()
 
 	s.CreateBucket("full")
-	s.PutObject("full", "obj.txt", strings.NewReader("data"), "")
+	s.PutObject("full", "obj.txt", strings.NewReader("data"), nil)
 
 	if err := s.DeleteBucket("full"); err == nil {
 		t.Fatal("should fail to delete non-empty bucket")
@@ -144,7 +144,7 @@ func TestPutGetRoundTrip(t *testing.T) {
 	s.CreateBucket("b")
 
 	body := "hello, geckos3"
-	meta, err := s.PutObject("b", "greet.txt", strings.NewReader(body), "text/plain")
+	meta, err := s.PutObject("b", "greet.txt", strings.NewReader(body), &PutObjectInput{ContentType: "text/plain"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -177,7 +177,7 @@ func TestPutObjectDefaultContentType(t *testing.T) {
 	defer cleanup()
 	s.CreateBucket("b")
 
-	meta, _ := s.PutObject("b", "file.bin", strings.NewReader("binary"), "")
+	meta, _ := s.PutObject("b", "file.bin", strings.NewReader("binary"), nil)
 	if meta.ContentType != "application/octet-stream" {
 		t.Errorf("default content-type: got %q", meta.ContentType)
 	}
@@ -188,8 +188,8 @@ func TestPutObjectOverwrite(t *testing.T) {
 	defer cleanup()
 	s.CreateBucket("b")
 
-	s.PutObject("b", "f.txt", strings.NewReader("version1"), "text/plain")
-	s.PutObject("b", "f.txt", strings.NewReader("version2"), "text/plain")
+	s.PutObject("b", "f.txt", strings.NewReader("version1"), &PutObjectInput{ContentType: "text/plain"})
+	s.PutObject("b", "f.txt", strings.NewReader("version2"), &PutObjectInput{ContentType: "text/plain"})
 
 	reader, _, _ := s.GetObject("b", "f.txt")
 	defer reader.Close()
@@ -204,7 +204,7 @@ func TestPutObjectNestedKey(t *testing.T) {
 	defer cleanup()
 	s.CreateBucket("b")
 
-	_, err := s.PutObject("b", "a/b/c/deep.txt", strings.NewReader("deep"), "")
+	_, err := s.PutObject("b", "a/b/c/deep.txt", strings.NewReader("deep"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -225,7 +225,7 @@ func TestPutObjectToNonExistentBucketCreatesIt(t *testing.T) {
 
 	// At the storage layer, PutObject creates dirs implicitly.
 	// Bucket existence is enforced at the HTTP handler level.
-	_, err := s.PutObject("newbucket", "file.txt", strings.NewReader("data"), "")
+	_, err := s.PutObject("newbucket", "file.txt", strings.NewReader("data"), nil)
 	if err != nil {
 		t.Fatalf("PutObject should create dirs implicitly: %v", err)
 	}
@@ -239,7 +239,7 @@ func TestPutObjectEmptyBody(t *testing.T) {
 	defer cleanup()
 	s.CreateBucket("b")
 
-	meta, err := s.PutObject("b", "zero.txt", strings.NewReader(""), "")
+	meta, err := s.PutObject("b", "zero.txt", strings.NewReader(""), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -285,7 +285,7 @@ func TestHeadObjectMatch(t *testing.T) {
 	s.CreateBucket("b")
 
 	body := "head-test-content"
-	putMeta, _ := s.PutObject("b", "h.txt", strings.NewReader(body), "application/json")
+	putMeta, _ := s.PutObject("b", "h.txt", strings.NewReader(body), &PutObjectInput{ContentType: "application/json"})
 
 	hMeta, err := s.HeadObject("b", "h.txt")
 	if err != nil {
@@ -318,7 +318,7 @@ func TestDeleteObject(t *testing.T) {
 	defer cleanup()
 	s.CreateBucket("b")
 
-	s.PutObject("b", "del.txt", strings.NewReader("gone"), "")
+	s.PutObject("b", "del.txt", strings.NewReader("gone"), nil)
 	if err := s.DeleteObject("b", "del.txt"); err != nil {
 		t.Fatal(err)
 	}
@@ -333,7 +333,7 @@ func TestDeleteObjectCleansEmptyDirs(t *testing.T) {
 	defer cleanup()
 	s.CreateBucket("b")
 
-	s.PutObject("b", "x/y/z/file.txt", strings.NewReader("deep"), "")
+	s.PutObject("b", "x/y/z/file.txt", strings.NewReader("deep"), nil)
 	s.DeleteObject("b", "x/y/z/file.txt")
 
 	if _, err := os.Stat(filepath.Join(s.dataDir, "b", "x")); err == nil {
@@ -346,7 +346,7 @@ func TestDeleteObjectMetadataCleaned(t *testing.T) {
 	defer cleanup()
 	s.CreateBucket("b")
 
-	s.PutObject("b", "m.txt", strings.NewReader("meta"), "")
+	s.PutObject("b", "m.txt", strings.NewReader("meta"), nil)
 	metaPath := s.metadataPath("b", "m.txt")
 	if _, err := os.Stat(metaPath); err != nil {
 		t.Fatalf("metadata should exist before delete: %v", err)
@@ -379,7 +379,7 @@ func TestCopyObjectSameBucket(t *testing.T) {
 	s.CreateBucket("b")
 
 	body := "copy-me"
-	s.PutObject("b", "orig.txt", strings.NewReader(body), "text/plain")
+	s.PutObject("b", "orig.txt", strings.NewReader(body), &PutObjectInput{ContentType: "text/plain"})
 
 	meta, err := s.CopyObject("b", "orig.txt", "b", "copied.txt")
 	if err != nil {
@@ -403,7 +403,7 @@ func TestCopyObjectCrossBucket(t *testing.T) {
 	s.CreateBucket("src")
 	s.CreateBucket("dst")
 
-	s.PutObject("src", "file.txt", strings.NewReader("cross-bucket"), "application/json")
+	s.PutObject("src", "file.txt", strings.NewReader("cross-bucket"), &PutObjectInput{ContentType: "application/json"})
 	meta, err := s.CopyObject("src", "file.txt", "dst", "file.txt")
 	if err != nil {
 		t.Fatal(err)
@@ -436,7 +436,7 @@ func TestCopyObjectToNested(t *testing.T) {
 	defer cleanup()
 	s.CreateBucket("b")
 
-	s.PutObject("b", "flat.txt", strings.NewReader("nested-copy"), "")
+	s.PutObject("b", "flat.txt", strings.NewReader("nested-copy"), nil)
 	_, err := s.CopyObject("b", "flat.txt", "b", "deep/nested/copy.txt")
 	if err != nil {
 		t.Fatal(err)
@@ -454,8 +454,8 @@ func TestCopyObjectOverwritesExisting(t *testing.T) {
 	defer cleanup()
 	s.CreateBucket("b")
 
-	s.PutObject("b", "src.txt", strings.NewReader("source"), "text/plain")
-	s.PutObject("b", "dst.txt", strings.NewReader("old-dest"), "text/html")
+	s.PutObject("b", "src.txt", strings.NewReader("source"), &PutObjectInput{ContentType: "text/plain"})
+	s.PutObject("b", "dst.txt", strings.NewReader("old-dest"), &PutObjectInput{ContentType: "text/html"})
 
 	_, err := s.CopyObject("b", "src.txt", "b", "dst.txt")
 	if err != nil {
@@ -492,9 +492,9 @@ func TestListObjectsWithPrefix(t *testing.T) {
 	defer cleanup()
 	s.CreateBucket("b")
 
-	s.PutObject("b", "logs/app.log", strings.NewReader("a"), "")
-	s.PutObject("b", "logs/err.log", strings.NewReader("b"), "")
-	s.PutObject("b", "data/file.csv", strings.NewReader("c"), "")
+	s.PutObject("b", "logs/app.log", strings.NewReader("a"), nil)
+	s.PutObject("b", "logs/err.log", strings.NewReader("b"), nil)
+	s.PutObject("b", "data/file.csv", strings.NewReader("c"), nil)
 
 	objs, _ := s.ListObjects("b", "logs/", 0)
 	if len(objs) != 2 {
@@ -514,7 +514,7 @@ func TestListObjectsMaxKeys(t *testing.T) {
 
 	for i := 0; i < 10; i++ {
 		key := "file" + string(rune('a'+i)) + ".txt"
-		s.PutObject("b", key, strings.NewReader("x"), "")
+		s.PutObject("b", key, strings.NewReader("x"), nil)
 	}
 
 	objs, _ := s.ListObjects("b", "", 3)
@@ -538,7 +538,7 @@ func TestListObjectsSkipsMetadataFiles(t *testing.T) {
 	defer cleanup()
 	s.CreateBucket("b")
 
-	s.PutObject("b", "real.txt", strings.NewReader("data"), "")
+	s.PutObject("b", "real.txt", strings.NewReader("data"), nil)
 
 	objs, _ := s.ListObjects("b", "", 0)
 	for _, o := range objs {
@@ -556,7 +556,7 @@ func TestListObjectsETagPresent(t *testing.T) {
 	defer cleanup()
 	s.CreateBucket("b")
 
-	putMeta, _ := s.PutObject("b", "x.txt", strings.NewReader("etag-check"), "")
+	putMeta, _ := s.PutObject("b", "x.txt", strings.NewReader("etag-check"), nil)
 	objs, _ := s.ListObjects("b", "", 0)
 	if len(objs) != 1 {
 		t.Fatal("expected 1 object")
@@ -574,7 +574,7 @@ func TestListObjectsUnlimited(t *testing.T) {
 	n := 50
 	for i := 0; i < n; i++ {
 		key := "item" + string(rune('A'+i%26)) + string(rune('0'+i/26)) + ".dat"
-		s.PutObject("b", key, strings.NewReader("x"), "")
+		s.PutObject("b", key, strings.NewReader("x"), nil)
 	}
 
 	objs, _ := s.ListObjects("b", "", 0)
@@ -619,7 +619,7 @@ func TestPathTraversalObjectKey(t *testing.T) {
 		"../secret",
 	}
 	for _, key := range attacks {
-		_, err := s.PutObject("b", key, strings.NewReader("evil"), "")
+		_, err := s.PutObject("b", key, strings.NewReader("evil"), nil)
 		if err == nil {
 			t.Errorf("should reject traversal key %q", key)
 		}
@@ -631,7 +631,7 @@ func TestNullByteInKeyRejected(t *testing.T) {
 	defer cleanup()
 	s.CreateBucket("b")
 
-	_, err := s.PutObject("b", "file\x00.txt", strings.NewReader("null"), "")
+	_, err := s.PutObject("b", "file\x00.txt", strings.NewReader("null"), nil)
 	if err == nil {
 		t.Fatal("should reject key with null byte")
 	}
@@ -642,7 +642,7 @@ func TestEmptyKeyRejected(t *testing.T) {
 	defer cleanup()
 	s.CreateBucket("b")
 
-	_, err := s.PutObject("b", "", strings.NewReader("empty"), "")
+	_, err := s.PutObject("b", "", strings.NewReader("empty"), nil)
 	if err == nil {
 		t.Fatal("should reject empty key")
 	}
@@ -708,7 +708,7 @@ func TestPathTraversalCopyObject(t *testing.T) {
 	s, cleanup := setupTestStorage(t)
 	defer cleanup()
 	s.CreateBucket("b")
-	s.PutObject("b", "legit.txt", strings.NewReader("ok"), "")
+	s.PutObject("b", "legit.txt", strings.NewReader("ok"), nil)
 
 	_, err := s.CopyObject("b", "legit.txt", "b", "../../escape.txt")
 	if err == nil {
@@ -730,7 +730,7 @@ func TestETagIsQuotedMD5(t *testing.T) {
 	defer cleanup()
 	s.CreateBucket("b")
 
-	meta, _ := s.PutObject("b", "etag.txt", strings.NewReader("hello"), "")
+	meta, _ := s.PutObject("b", "etag.txt", strings.NewReader("hello"), nil)
 
 	if !strings.HasPrefix(meta.ETag, "\"") || !strings.HasSuffix(meta.ETag, "\"") {
 		t.Errorf("ETag should be quoted: %q", meta.ETag)
@@ -746,7 +746,7 @@ func TestETagConsistentAcrossOperations(t *testing.T) {
 	defer cleanup()
 	s.CreateBucket("b")
 
-	putMeta, _ := s.PutObject("b", "e.txt", strings.NewReader("consistent"), "")
+	putMeta, _ := s.PutObject("b", "e.txt", strings.NewReader("consistent"), nil)
 	_, getMeta, _ := s.GetObject("b", "e.txt")
 	headMeta, _ := s.HeadObject("b", "e.txt")
 	objs, _ := s.ListObjects("b", "", 0)
@@ -767,8 +767,8 @@ func TestETagDiffersForDifferentContent(t *testing.T) {
 	defer cleanup()
 	s.CreateBucket("b")
 
-	m1, _ := s.PutObject("b", "a.txt", strings.NewReader("aaa"), "")
-	m2, _ := s.PutObject("b", "b.txt", strings.NewReader("bbb"), "")
+	m1, _ := s.PutObject("b", "a.txt", strings.NewReader("aaa"), nil)
+	m2, _ := s.PutObject("b", "b.txt", strings.NewReader("bbb"), nil)
 
 	if m1.ETag == m2.ETag {
 		t.Error("different content should produce different ETags")
@@ -780,8 +780,8 @@ func TestETagSameForSameContent(t *testing.T) {
 	defer cleanup()
 	s.CreateBucket("b")
 
-	m1, _ := s.PutObject("b", "a.txt", strings.NewReader("same"), "")
-	m2, _ := s.PutObject("b", "b.txt", strings.NewReader("same"), "")
+	m1, _ := s.PutObject("b", "a.txt", strings.NewReader("same"), nil)
+	m2, _ := s.PutObject("b", "b.txt", strings.NewReader("same"), nil)
 
 	if m1.ETag != m2.ETag {
 		t.Error("same content should produce same ETag")
@@ -806,7 +806,7 @@ func TestContentTypePreserved(t *testing.T) {
 	}
 	for i, ct := range types {
 		key := "file" + string(rune('A'+i)) + ".dat"
-		s.PutObject("b", key, strings.NewReader("data"), ct)
+		s.PutObject("b", key, strings.NewReader("data"), &PutObjectInput{ContentType: ct})
 
 		_, getMeta, _ := s.GetObject("b", key)
 		if getMeta.ContentType != ct {
@@ -835,7 +835,7 @@ func TestConcurrentPutsSameKey(t *testing.T) {
 		go func(n int) {
 			defer wg.Done()
 			data := bytes.Repeat([]byte{byte(n)}, 1024)
-			s.PutObject("b", "race.txt", bytes.NewReader(data), "")
+			s.PutObject("b", "race.txt", bytes.NewReader(data), nil)
 		}(i)
 	}
 	wg.Wait()
@@ -863,7 +863,7 @@ func TestConcurrentPutsDifferentKeys(t *testing.T) {
 		go func(idx int) {
 			defer wg.Done()
 			key := "file" + string(rune('A'+idx%26)) + string(rune('0'+idx/26)) + ".txt"
-			s.PutObject("b", key, strings.NewReader("concurrent"), "")
+			s.PutObject("b", key, strings.NewReader("concurrent"), nil)
 		}(i)
 	}
 	wg.Wait()
@@ -879,7 +879,7 @@ func TestConcurrentReadsAndWrites(t *testing.T) {
 	defer cleanup()
 	s.CreateBucket("b")
 
-	s.PutObject("b", "shared.txt", strings.NewReader("initial"), "")
+	s.PutObject("b", "shared.txt", strings.NewReader("initial"), nil)
 
 	var wg sync.WaitGroup
 
@@ -905,7 +905,7 @@ func TestConcurrentReadsAndWrites(t *testing.T) {
 			defer wg.Done()
 			for j := 0; j < 10; j++ {
 				data := bytes.Repeat([]byte{byte(n)}, 100)
-				s.PutObject("b", "shared.txt", bytes.NewReader(data), "")
+				s.PutObject("b", "shared.txt", bytes.NewReader(data), nil)
 			}
 		}(i)
 	}
@@ -935,7 +935,7 @@ func TestLargeObject(t *testing.T) {
 	size := 10 * 1024 * 1024 // 10MB
 	data := bytes.Repeat([]byte("x"), size)
 
-	meta, err := s.PutObject("b", "big.bin", bytes.NewReader(data), "application/octet-stream")
+	meta, err := s.PutObject("b", "big.bin", bytes.NewReader(data), &PutObjectInput{ContentType: "application/octet-stream"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -963,7 +963,7 @@ func TestMetadataFileCreated(t *testing.T) {
 	defer cleanup()
 	s.CreateBucket("b")
 
-	s.PutObject("b", "m.txt", strings.NewReader("meta"), "")
+	s.PutObject("b", "m.txt", strings.NewReader("meta"), nil)
 	metaPath := s.metadataPath("b", "m.txt")
 	if _, err := os.Stat(metaPath); err != nil {
 		t.Fatalf("metadata sidecar should exist: %v", err)
@@ -975,10 +975,10 @@ func TestMetadataSurvivesOverwrite(t *testing.T) {
 	defer cleanup()
 	s.CreateBucket("b")
 
-	s.PutObject("b", "ow.txt", strings.NewReader("v1"), "text/plain")
+	s.PutObject("b", "ow.txt", strings.NewReader("v1"), &PutObjectInput{ContentType: "text/plain"})
 	_, m1, _ := s.GetObject("b", "ow.txt")
 
-	s.PutObject("b", "ow.txt", strings.NewReader("v2-changed"), "application/json")
+	s.PutObject("b", "ow.txt", strings.NewReader("v2-changed"), &PutObjectInput{ContentType: "application/json"})
 	_, m2, _ := s.GetObject("b", "ow.txt")
 
 	if m1.ETag == m2.ETag {
@@ -1019,6 +1019,437 @@ func TestObjectPathMapping(t *testing.T) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// Multipart Upload – Storage Layer
+// ═══════════════════════════════════════════════════════════════════════════════
+
+func TestMultipartUploadBasic(t *testing.T) {
+	s, cleanup := setupTestStorage(t)
+	defer cleanup()
+	s.CreateBucket("b")
+
+	// Create multipart upload
+	uploadID, err := s.CreateMultipartUpload("b", "multipart.txt", "text/plain")
+	if err != nil {
+		t.Fatalf("CreateMultipartUpload: %v", err)
+	}
+	if uploadID == "" {
+		t.Fatal("uploadID should not be empty")
+	}
+
+	// Upload two parts
+	etag1, err := s.UploadPart("b", "multipart.txt", uploadID, 1, strings.NewReader("Hello, "))
+	if err != nil {
+		t.Fatalf("UploadPart 1: %v", err)
+	}
+	if etag1 == "" {
+		t.Fatal("part 1 etag should not be empty")
+	}
+
+	etag2, err := s.UploadPart("b", "multipart.txt", uploadID, 2, strings.NewReader("World!"))
+	if err != nil {
+		t.Fatalf("UploadPart 2: %v", err)
+	}
+
+	// Complete
+	parts := []CompletedPart{
+		{PartNumber: 1, ETag: etag1},
+		{PartNumber: 2, ETag: etag2},
+	}
+	meta, err := s.CompleteMultipartUpload("b", "multipart.txt", uploadID, parts)
+	if err != nil {
+		t.Fatalf("CompleteMultipartUpload: %v", err)
+	}
+	if meta.Size != 13 {
+		t.Errorf("expected size 13, got %d", meta.Size)
+	}
+	if meta.ContentType != "text/plain" {
+		t.Errorf("content type: %q", meta.ContentType)
+	}
+	// Multipart ETag should contain "-2" suffix
+	if !strings.Contains(meta.ETag, "-2") {
+		t.Errorf("multipart etag should contain '-2': %q", meta.ETag)
+	}
+
+	// Verify object is readable
+	reader, getMeta, err := s.GetObject("b", "multipart.txt")
+	if err != nil {
+		t.Fatalf("GetObject after multipart: %v", err)
+	}
+	data, _ := io.ReadAll(reader)
+	reader.Close()
+	if string(data) != "Hello, World!" {
+		t.Errorf("content: %q", string(data))
+	}
+	if getMeta.ContentType != "text/plain" {
+		t.Errorf("GetObject content type: %q", getMeta.ContentType)
+	}
+}
+
+func TestMultipartUploadBucketNotExist(t *testing.T) {
+	s, cleanup := setupTestStorage(t)
+	defer cleanup()
+
+	_, err := s.CreateMultipartUpload("ghost", "file.txt", "text/plain")
+	if err == nil {
+		t.Fatal("should fail for non-existent bucket")
+	}
+}
+
+func TestMultipartUploadInvalidUploadID(t *testing.T) {
+	s, cleanup := setupTestStorage(t)
+	defer cleanup()
+	s.CreateBucket("b")
+
+	_, err := s.UploadPart("b", "file.txt", "invalid-upload-id", 1, strings.NewReader("data"))
+	if err == nil {
+		t.Fatal("UploadPart should fail with invalid uploadID")
+	}
+}
+
+func TestMultipartUploadAbort(t *testing.T) {
+	s, cleanup := setupTestStorage(t)
+	defer cleanup()
+	s.CreateBucket("b")
+
+	uploadID, _ := s.CreateMultipartUpload("b", "abort.txt", "text/plain")
+	s.UploadPart("b", "abort.txt", uploadID, 1, strings.NewReader("data"))
+
+	if err := s.AbortMultipartUpload("b", "abort.txt", uploadID); err != nil {
+		t.Fatalf("AbortMultipartUpload: %v", err)
+	}
+
+	// After abort, the upload should no longer exist
+	_, err := s.UploadPart("b", "abort.txt", uploadID, 2, strings.NewReader("more"))
+	if err == nil {
+		t.Fatal("UploadPart should fail after abort")
+	}
+
+	// Object should NOT exist
+	_, _, err = s.GetObject("b", "abort.txt")
+	if err == nil {
+		t.Fatal("object should not exist after abort")
+	}
+}
+
+func TestMultipartUploadAbortInvalidID(t *testing.T) {
+	s, cleanup := setupTestStorage(t)
+	defer cleanup()
+	s.CreateBucket("b")
+
+	err := s.AbortMultipartUpload("b", "file.txt", "nonexistent")
+	if err == nil {
+		t.Fatal("abort should fail with invalid uploadID")
+	}
+}
+
+func TestMultipartCompleteMissingPart(t *testing.T) {
+	s, cleanup := setupTestStorage(t)
+	defer cleanup()
+	s.CreateBucket("b")
+
+	uploadID, _ := s.CreateMultipartUpload("b", "missing.txt", "text/plain")
+	s.UploadPart("b", "missing.txt", uploadID, 1, strings.NewReader("data"))
+
+	// Complete with part 2 which was never uploaded
+	parts := []CompletedPart{
+		{PartNumber: 1, ETag: "\"x\""},
+		{PartNumber: 2, ETag: "\"y\""},
+	}
+	_, err := s.CompleteMultipartUpload("b", "missing.txt", uploadID, parts)
+	if err == nil {
+		t.Fatal("should fail when part is missing")
+	}
+}
+
+func TestMultipartCompleteInvalidUploadID(t *testing.T) {
+	s, cleanup := setupTestStorage(t)
+	defer cleanup()
+	s.CreateBucket("b")
+
+	_, err := s.CompleteMultipartUpload("b", "file.txt", "bad-id", nil)
+	if err == nil {
+		t.Fatal("should fail with invalid uploadID")
+	}
+}
+
+func TestMultipartUploadDefaultContentType(t *testing.T) {
+	s, cleanup := setupTestStorage(t)
+	defer cleanup()
+	s.CreateBucket("b")
+
+	uploadID, _ := s.CreateMultipartUpload("b", "file.bin", "")
+	etag, _ := s.UploadPart("b", "file.bin", uploadID, 1, strings.NewReader("binary"))
+	meta, err := s.CompleteMultipartUpload("b", "file.bin", uploadID, []CompletedPart{
+		{PartNumber: 1, ETag: etag},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.ContentType != "application/octet-stream" {
+		t.Errorf("default content type: %q", meta.ContentType)
+	}
+}
+
+func TestMultipartUploadSinglePart(t *testing.T) {
+	s, cleanup := setupTestStorage(t)
+	defer cleanup()
+	s.CreateBucket("b")
+
+	uploadID, _ := s.CreateMultipartUpload("b", "single.txt", "text/plain")
+	etag, _ := s.UploadPart("b", "single.txt", uploadID, 1, strings.NewReader("only-one-part"))
+
+	meta, err := s.CompleteMultipartUpload("b", "single.txt", uploadID, []CompletedPart{
+		{PartNumber: 1, ETag: etag},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(meta.ETag, "-1") {
+		t.Errorf("single-part multipart etag should end with -1: %q", meta.ETag)
+	}
+
+	reader, _, _ := s.GetObject("b", "single.txt")
+	data, _ := io.ReadAll(reader)
+	reader.Close()
+	if string(data) != "only-one-part" {
+		t.Errorf("content: %q", string(data))
+	}
+}
+
+func TestMultipartUploadLargePartCount(t *testing.T) {
+	s, cleanup := setupTestStorage(t)
+	defer cleanup()
+	s.CreateBucket("b")
+
+	uploadID, _ := s.CreateMultipartUpload("b", "many-parts.txt", "text/plain")
+
+	var parts []CompletedPart
+	for i := 1; i <= 5; i++ {
+		data := strings.Repeat(string(rune('a'+i-1)), 100)
+		etag, err := s.UploadPart("b", "many-parts.txt", uploadID, i, strings.NewReader(data))
+		if err != nil {
+			t.Fatalf("UploadPart %d: %v", i, err)
+		}
+		parts = append(parts, CompletedPart{PartNumber: i, ETag: etag})
+	}
+
+	meta, err := s.CompleteMultipartUpload("b", "many-parts.txt", uploadID, parts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.Size != 500 {
+		t.Errorf("total size: %d, want 500", meta.Size)
+	}
+	if !strings.Contains(meta.ETag, "-5") {
+		t.Errorf("etag should contain -5: %q", meta.ETag)
+	}
+}
+
+func TestMultipartUploadDoesNotAppearInListing(t *testing.T) {
+	s, cleanup := setupTestStorage(t)
+	defer cleanup()
+	s.CreateBucket("b")
+
+	// Start a multipart upload but don't complete it
+	uploadID, _ := s.CreateMultipartUpload("b", "pending.txt", "text/plain")
+	s.UploadPart("b", "pending.txt", uploadID, 1, strings.NewReader("partial"))
+
+	// Also put a normal object
+	s.PutObject("b", "normal.txt", strings.NewReader("ok"), nil)
+
+	objects, err := s.ListObjects("b", "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, obj := range objects {
+		if strings.Contains(obj.Key, multipartStagingDir) || strings.Contains(obj.Key, "pending") {
+			t.Errorf("multipart staging should not appear in listing: %q", obj.Key)
+		}
+	}
+	if len(objects) != 1 || objects[0].Key != "normal.txt" {
+		t.Errorf("expected only normal.txt, got %v", objects)
+	}
+}
+
+func TestMultipartOverwritesExistingObject(t *testing.T) {
+	s, cleanup := setupTestStorage(t)
+	defer cleanup()
+	s.CreateBucket("b")
+
+	// Put a regular object first
+	s.PutObject("b", "overwrite.txt", strings.NewReader("original"), nil)
+
+	// Overwrite via multipart
+	uploadID, _ := s.CreateMultipartUpload("b", "overwrite.txt", "text/plain")
+	etag, _ := s.UploadPart("b", "overwrite.txt", uploadID, 1, strings.NewReader("replaced"))
+	_, err := s.CompleteMultipartUpload("b", "overwrite.txt", uploadID, []CompletedPart{
+		{PartNumber: 1, ETag: etag},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reader, _, _ := s.GetObject("b", "overwrite.txt")
+	data, _ := io.ReadAll(reader)
+	reader.Close()
+	if string(data) != "replaced" {
+		t.Errorf("content after overwrite: %q", string(data))
+	}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Custom Metadata & Standard Headers – Storage Layer
+// ═══════════════════════════════════════════════════════════════════════════════
+
+func TestPutObjectWithCustomMetadata(t *testing.T) {
+	s, cleanup := setupTestStorage(t)
+	defer cleanup()
+	s.CreateBucket("b")
+
+	input := &PutObjectInput{
+		ContentType:    "application/json",
+		CustomMetadata: map[string]string{"author": "alice", "version": "1.0"},
+	}
+	_, err := s.PutObject("b", "meta.json", strings.NewReader("{}"), input)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, meta, err := s.GetObject("b", "meta.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.CustomMetadata["author"] != "alice" {
+		t.Errorf("author: %q", meta.CustomMetadata["author"])
+	}
+	if meta.CustomMetadata["version"] != "1.0" {
+		t.Errorf("version: %q", meta.CustomMetadata["version"])
+	}
+}
+
+func TestPutObjectWithStandardHeaders(t *testing.T) {
+	s, cleanup := setupTestStorage(t)
+	defer cleanup()
+	s.CreateBucket("b")
+
+	input := &PutObjectInput{
+		ContentType:        "text/css",
+		ContentEncoding:    "gzip",
+		ContentDisposition: "attachment; filename=\"style.css\"",
+		CacheControl:       "max-age=3600",
+	}
+	_, err := s.PutObject("b", "style.css", strings.NewReader("body{}"), input)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	meta, err := s.HeadObject("b", "style.css")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.ContentEncoding != "gzip" {
+		t.Errorf("ContentEncoding: %q", meta.ContentEncoding)
+	}
+	if meta.ContentDisposition != "attachment; filename=\"style.css\"" {
+		t.Errorf("ContentDisposition: %q", meta.ContentDisposition)
+	}
+	if meta.CacheControl != "max-age=3600" {
+		t.Errorf("CacheControl: %q", meta.CacheControl)
+	}
+	if meta.ContentType != "text/css" {
+		t.Errorf("ContentType: %q", meta.ContentType)
+	}
+}
+
+func TestPutObjectNilInputDefaults(t *testing.T) {
+	s, cleanup := setupTestStorage(t)
+	defer cleanup()
+	s.CreateBucket("b")
+
+	meta, err := s.PutObject("b", "default.bin", strings.NewReader("data"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.ContentType != "application/octet-stream" {
+		t.Errorf("nil input should default to octet-stream: %q", meta.ContentType)
+	}
+	if meta.ContentEncoding != "" {
+		t.Errorf("nil input ContentEncoding should be empty: %q", meta.ContentEncoding)
+	}
+}
+
+func TestOverwritePreservesNewMetadata(t *testing.T) {
+	s, cleanup := setupTestStorage(t)
+	defer cleanup()
+	s.CreateBucket("b")
+
+	// First write with metadata
+	input1 := &PutObjectInput{
+		ContentType:    "text/plain",
+		CacheControl:   "no-cache",
+		CustomMetadata: map[string]string{"key1": "val1"},
+	}
+	s.PutObject("b", "file.txt", strings.NewReader("v1"), input1)
+
+	// Overwrite with different metadata
+	input2 := &PutObjectInput{
+		ContentType:    "application/json",
+		CacheControl:   "max-age=600",
+		CustomMetadata: map[string]string{"key2": "val2"},
+	}
+	s.PutObject("b", "file.txt", strings.NewReader("v2"), input2)
+
+	meta, _ := s.HeadObject("b", "file.txt")
+	if meta.ContentType != "application/json" {
+		t.Errorf("ContentType: %q", meta.ContentType)
+	}
+	if meta.CacheControl != "max-age=600" {
+		t.Errorf("CacheControl: %q", meta.CacheControl)
+	}
+	if meta.CustomMetadata["key2"] != "val2" {
+		t.Errorf("new key2: %q", meta.CustomMetadata["key2"])
+	}
+	// Old metadata should be gone
+	if _, ok := meta.CustomMetadata["key1"]; ok {
+		t.Error("old key1 should not survive overwrite")
+	}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Lock Striping – Verify Deterministic Stripe Selection
+// ═══════════════════════════════════════════════════════════════════════════════
+
+func TestLockStripeConsistency(t *testing.T) {
+	s, cleanup := setupTestStorage(t)
+	defer cleanup()
+
+	path := s.objectPath("bucket", "key.txt")
+	mu1 := s.stripe(path)
+	mu2 := s.stripe(path)
+
+	// Same path must always map to the same stripe
+	if mu1 != mu2 {
+		t.Error("stripe() should return same mutex for same path")
+	}
+}
+
+func TestLockStripeDifferentKeys(t *testing.T) {
+	s, cleanup := setupTestStorage(t)
+	defer cleanup()
+
+	// Different paths may or may not hit different stripes,
+	// but the call should never panic.
+	for i := 0; i < 1000; i++ {
+		path := s.objectPath("bucket", strings.Repeat("x", i))
+		mu := s.stripe(path)
+		if mu == nil {
+			t.Fatal("stripe returned nil")
+		}
+	}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // Benchmarks
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1032,7 +1463,7 @@ func BenchmarkPutObject(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		key := filepath.Join("test", string(rune(i%26+97)), "file.txt")
-		storage.PutObject("benchmark", key, bytes.NewReader(content), "")
+		storage.PutObject("benchmark", key, bytes.NewReader(content), nil)
 	}
 }
 
@@ -1042,7 +1473,7 @@ func BenchmarkGetObject(b *testing.B) {
 	storage.CreateBucket("benchmark")
 
 	content := bytes.Repeat([]byte("a"), 1024) // 1KB
-	storage.PutObject("benchmark", "test.txt", bytes.NewReader(content), "")
+	storage.PutObject("benchmark", "test.txt", bytes.NewReader(content), nil)
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {

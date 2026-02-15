@@ -8,6 +8,10 @@
 
 A lightweight S3-compatible object storage server that maps buckets to directories and objects to files on the local filesystem. Single binary, zero dependencies, pure Go.
 
+**Key features:** Multipart uploads, custom metadata (`x-amz-meta-*`), standard HTTP headers (`Content-Encoding`, `Content-Disposition`, `Cache-Control`), SHA-256 payload verification, SigV4 authentication (header + presigned URL), atomic writes, range requests, and structured JSON logging.
+
+![geckos3](https://github.com/user-attachments/assets/59e3b56b-607e-4ffc-a1d5-2ad0c063214d)
+
 > **Note:** geckos3 is designed for **local development**, **testing**, **CI pipelines**, and **self-hosted single-node setups** where you need an S3-compatible API without the overhead of a full object storage system. It is **not** intended for production workloads that require replication, high availability, or multi-node clustering.
 
 ## Quick Start
@@ -120,20 +124,24 @@ export GECKOS3_SECRET_KEY=mysecret
 
 ## Supported S3 Operations
 
-| Operation     | Method   | Path                                           |
-| ------------- | -------- | ---------------------------------------------- |
-| ListBuckets   | `GET`    | `/`                                            |
-| CreateBucket  | `PUT`    | `/{bucket}`                                    |
-| DeleteBucket  | `DELETE` | `/{bucket}`                                    |
-| HeadBucket    | `HEAD`   | `/{bucket}`                                    |
-| ListObjectsV1 | `GET`    | `/{bucket}`                                    |
-| ListObjectsV2 | `GET`    | `/{bucket}?list-type=2`                        |
-| PutObject     | `PUT`    | `/{bucket}/{key}`                              |
-| GetObject     | `GET`    | `/{bucket}/{key}`                              |
-| HeadObject    | `HEAD`   | `/{bucket}/{key}`                              |
-| DeleteObject  | `DELETE` | `/{bucket}/{key}`                              |
-| CopyObject    | `PUT`    | `/{bucket}/{key}` + `x-amz-copy-source` header |
-| DeleteObjects | `POST`   | `/{bucket}?delete`                             |
+| Operation               | Method   | Path                                           |
+| ----------------------- | -------- | ---------------------------------------------- |
+| ListBuckets             | `GET`    | `/`                                            |
+| CreateBucket            | `PUT`    | `/{bucket}`                                    |
+| DeleteBucket            | `DELETE` | `/{bucket}`                                    |
+| HeadBucket              | `HEAD`   | `/{bucket}`                                    |
+| ListObjectsV1           | `GET`    | `/{bucket}`                                    |
+| ListObjectsV2           | `GET`    | `/{bucket}?list-type=2`                        |
+| PutObject               | `PUT`    | `/{bucket}/{key}`                              |
+| GetObject               | `GET`    | `/{bucket}/{key}`                              |
+| HeadObject              | `HEAD`   | `/{bucket}/{key}`                              |
+| DeleteObject            | `DELETE` | `/{bucket}/{key}`                              |
+| CopyObject              | `PUT`    | `/{bucket}/{key}` + `x-amz-copy-source` header |
+| DeleteObjects           | `POST`   | `/{bucket}?delete`                             |
+| CreateMultipartUpload   | `POST`   | `/{bucket}/{key}?uploads`                      |
+| UploadPart              | `PUT`    | `/{bucket}/{key}?partNumber={n}&uploadId={id}` |
+| CompleteMultipartUpload | `POST`   | `/{bucket}/{key}?uploadId={id}`                |
+| AbortMultipartUpload    | `DELETE` | `/{bucket}/{key}?uploadId={id}`                |
 
 **ListObjectsV1** supports `prefix`, `delimiter`, `max-keys`, and `marker` parameters.
 
@@ -144,6 +152,14 @@ export GECKOS3_SECRET_KEY=mysecret
 **GetObject** supports HTTP `Range` requests for partial content retrieval.
 
 **Content-Type** is preserved — the Content-Type sent during PUT is stored and returned on GET/HEAD.
+
+**Custom Metadata** — Any `x-amz-meta-*` headers sent during PUT are stored and returned on GET/HEAD.
+
+**Standard Headers** — `Content-Encoding`, `Content-Disposition`, and `Cache-Control` headers sent during PUT are stored and returned on GET/HEAD.
+
+**Multipart Upload** — Create an upload with `POST ?uploads`, upload parts with `PUT ?partNumber=N&uploadId=X`, complete with `POST ?uploadId=X`, or abort with `DELETE ?uploadId=X`. Parts are staged on the filesystem and concatenated on completion. The multipart ETag follows the S3 convention (`md5-N`).
+
+**Payload Verification** — When `X-Amz-Content-Sha256` is set to a hex SHA-256 digest (not `UNSIGNED-PAYLOAD`), the server verifies the payload matches and returns `400 BadDigest` on mismatch.
 
 ## Usage with AWS CLI
 
@@ -178,6 +194,20 @@ s3.create_bucket(Bucket="mybucket")
 s3.put_object(Bucket="mybucket", Key="hello.txt", Body=b"Hello, World!")
 obj = s3.get_object(Bucket="mybucket", Key="hello.txt")
 print(obj["Body"].read().decode())
+
+# With custom metadata and headers
+s3.put_object(
+    Bucket="mybucket",
+    Key="report.pdf",
+    Body=open("report.pdf", "rb"),
+    ContentType="application/pdf",
+    ContentDisposition='attachment; filename="report.pdf"',
+    CacheControl="max-age=86400",
+    Metadata={"author": "alice", "version": "2.0"},
+)
+
+# Multipart upload (handled automatically by boto3 for large files)
+s3.upload_file("large-file.bin", "mybucket", "large-file.bin")
 ```
 
 ## Docker
@@ -238,10 +268,14 @@ Bucket names must be 3–63 characters, lowercase alphanumeric plus hyphens and 
 - Buckets are directories under the data dir
 - Objects are files within bucket directories
 - Nested keys (e.g. `dir/file.txt`) create subdirectories automatically
-- Metadata (ETag, Content-Type, timestamps) is stored in `.metadata.json` sidecar files
+- Metadata (ETag, Content-Type, custom headers, `x-amz-meta-*`) is stored in `.metadata.json` sidecar files
 - Authentication uses AWS Signature Version 4 (header and presigned URL)
 - All writes are atomic (temp file + fsync + rename)
+- Concurrent writes are protected by lock striping (256 fixed mutexes, FNV-1a hash selection) — no per-key memory growth
+- Multipart uploads are staged in a hidden `.geckos3-multipart/` directory per bucket and excluded from object listings
+- ListObjects is bounded to 100,000 scanned objects to prevent OOM on very large buckets
 - Path traversal is blocked — keys that escape the data directory are rejected
+- HTTP server enforces `ReadHeaderTimeout` (10s), `ReadTimeout` / `WriteTimeout` (6h for large uploads), and `IdleTimeout` (120s)
 
 ## Logging
 
@@ -279,12 +313,12 @@ make lint            Run go vet
 
 ## Limitations
 
-- No multipart upload
 - No versioning, lifecycle policies, or ACLs
 - No TLS — use a reverse proxy (nginx, Caddy) for HTTPS
 - No rate limiting — use a reverse proxy for rate limiting
 - No upload size limit — relies on filesystem quotas
 - Single-node only, no replication
+- ListObjects scans up to 100,000 objects per bucket (returns error beyond this limit)
 
 ## License
 

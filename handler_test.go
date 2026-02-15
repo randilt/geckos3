@@ -2,7 +2,10 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/xml"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -1244,5 +1247,568 @@ func TestHTTPPutEmptyObject(t *testing.T) {
 	headResp.Body.Close()
 	if headResp.Header.Get("Content-Length") != "0" {
 		t.Errorf("empty object length: %q", headResp.Header.Get("Content-Length"))
+	}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Multipart Upload – Handler Layer
+// ═══════════════════════════════════════════════════════════════════════════════
+
+func TestHTTPMultipartUploadBasic(t *testing.T) {
+	srv, _ := setupTestServer(t)
+
+	// Create bucket
+	mustDo(t, "PUT", srv.URL+"/mybucket", nil, nil).Body.Close()
+
+	// Initiate multipart upload: POST /{bucket}/{key}?uploads
+	resp := mustDo(t, "POST", srv.URL+"/mybucket/multi.txt?uploads", nil,
+		map[string]string{"Content-Type": "text/plain"})
+	body := readBody(t, resp)
+	if resp.StatusCode != 200 {
+		t.Fatalf("initiate multipart: %d", resp.StatusCode)
+	}
+
+	var initResult InitiateMultipartUploadResult
+	if err := xml.Unmarshal([]byte(body), &initResult); err != nil {
+		t.Fatalf("unmarshal initiate result: %v", err)
+	}
+	if initResult.UploadId == "" {
+		t.Fatal("UploadId should not be empty")
+	}
+	if initResult.Bucket != "mybucket" {
+		t.Errorf("Bucket: %q", initResult.Bucket)
+	}
+	if initResult.Key != "multi.txt" {
+		t.Errorf("Key: %q", initResult.Key)
+	}
+	uploadID := initResult.UploadId
+
+	// Upload part 1: PUT /{bucket}/{key}?partNumber=1&uploadId=X
+	part1Resp := mustDo(t, "PUT",
+		fmt.Sprintf("%s/mybucket/multi.txt?partNumber=1&uploadId=%s", srv.URL, uploadID),
+		strings.NewReader("part-one-"), nil)
+	part1Resp.Body.Close()
+	if part1Resp.StatusCode != 200 {
+		t.Fatalf("upload part 1: %d", part1Resp.StatusCode)
+	}
+	etag1 := part1Resp.Header.Get("ETag")
+	if etag1 == "" {
+		t.Fatal("part 1 ETag missing")
+	}
+
+	// Upload part 2
+	part2Resp := mustDo(t, "PUT",
+		fmt.Sprintf("%s/mybucket/multi.txt?partNumber=2&uploadId=%s", srv.URL, uploadID),
+		strings.NewReader("part-two"), nil)
+	part2Resp.Body.Close()
+	if part2Resp.StatusCode != 200 {
+		t.Fatalf("upload part 2: %d", part2Resp.StatusCode)
+	}
+	etag2 := part2Resp.Header.Get("ETag")
+
+	// Complete multipart: POST /{bucket}/{key}?uploadId=X
+	completeXML := fmt.Sprintf(
+		`<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>%s</ETag></Part><Part><PartNumber>2</PartNumber><ETag>%s</ETag></Part></CompleteMultipartUpload>`,
+		etag1, etag2)
+
+	completeResp := mustDo(t, "POST",
+		fmt.Sprintf("%s/mybucket/multi.txt?uploadId=%s", srv.URL, uploadID),
+		strings.NewReader(completeXML), nil)
+	completeBody := readBody(t, completeResp)
+	if completeResp.StatusCode != 200 {
+		t.Fatalf("complete multipart: %d, body: %s", completeResp.StatusCode, completeBody)
+	}
+
+	var completeResult CompleteMultipartUploadResultXML
+	xml.Unmarshal([]byte(completeBody), &completeResult)
+	if completeResult.Bucket != "mybucket" {
+		t.Errorf("complete Bucket: %q", completeResult.Bucket)
+	}
+	if completeResult.Key != "multi.txt" {
+		t.Errorf("complete Key: %q", completeResult.Key)
+	}
+	if completeResult.ETag == "" {
+		t.Error("complete ETag should not be empty")
+	}
+
+	// Verify the assembled object content
+	getResp := mustDo(t, "GET", srv.URL+"/mybucket/multi.txt", nil, nil)
+	content := readBody(t, getResp)
+	if content != "part-one-part-two" {
+		t.Errorf("assembled content: %q", content)
+	}
+}
+
+func TestHTTPMultipartUploadAbort(t *testing.T) {
+	srv, _ := setupTestServer(t)
+	mustDo(t, "PUT", srv.URL+"/mybucket", nil, nil).Body.Close()
+
+	// Initiate + upload a part
+	resp := mustDo(t, "POST", srv.URL+"/mybucket/abort.txt?uploads", nil, nil)
+	body := readBody(t, resp)
+	var initResult InitiateMultipartUploadResult
+	xml.Unmarshal([]byte(body), &initResult)
+	uploadID := initResult.UploadId
+
+	mustDo(t, "PUT",
+		fmt.Sprintf("%s/mybucket/abort.txt?partNumber=1&uploadId=%s", srv.URL, uploadID),
+		strings.NewReader("data"), nil).Body.Close()
+
+	// Abort: DELETE /{bucket}/{key}?uploadId=X
+	abortResp := mustDo(t, "DELETE",
+		fmt.Sprintf("%s/mybucket/abort.txt?uploadId=%s", srv.URL, uploadID),
+		nil, nil)
+	abortResp.Body.Close()
+	if abortResp.StatusCode != 204 {
+		t.Errorf("abort: expected 204, got %d", abortResp.StatusCode)
+	}
+
+	// Object should not exist
+	getResp := mustDo(t, "GET", srv.URL+"/mybucket/abort.txt", nil, nil)
+	getResp.Body.Close()
+	if getResp.StatusCode != 404 {
+		t.Errorf("after abort, GET should 404, got %d", getResp.StatusCode)
+	}
+}
+
+func TestHTTPMultipartUploadInvalidPartNumber(t *testing.T) {
+	srv, _ := setupTestServer(t)
+	mustDo(t, "PUT", srv.URL+"/mybucket", nil, nil).Body.Close()
+
+	resp := mustDo(t, "POST", srv.URL+"/mybucket/file.txt?uploads", nil, nil)
+	body := readBody(t, resp)
+	var initResult InitiateMultipartUploadResult
+	xml.Unmarshal([]byte(body), &initResult)
+	uploadID := initResult.UploadId
+
+	// Part number 0 is invalid
+	badResp := mustDo(t, "PUT",
+		fmt.Sprintf("%s/mybucket/file.txt?partNumber=0&uploadId=%s", srv.URL, uploadID),
+		strings.NewReader("data"), nil)
+	badResp.Body.Close()
+	if badResp.StatusCode != 400 {
+		t.Errorf("part 0: expected 400, got %d", badResp.StatusCode)
+	}
+
+	// Non-numeric part number
+	badResp2 := mustDo(t, "PUT",
+		fmt.Sprintf("%s/mybucket/file.txt?partNumber=abc&uploadId=%s", srv.URL, uploadID),
+		strings.NewReader("data"), nil)
+	badResp2.Body.Close()
+	if badResp2.StatusCode != 400 {
+		t.Errorf("non-numeric part: expected 400, got %d", badResp2.StatusCode)
+	}
+}
+
+func TestHTTPMultipartUploadNonExistentBucket(t *testing.T) {
+	srv, _ := setupTestServer(t)
+
+	resp := mustDo(t, "POST", srv.URL+"/ghostbucket/file.txt?uploads", nil, nil)
+	resp.Body.Close()
+	if resp.StatusCode != 404 {
+		t.Errorf("initiate in non-existent bucket: expected 404, got %d", resp.StatusCode)
+	}
+}
+
+func TestHTTPMultipartCompleteMalformedXML(t *testing.T) {
+	srv, _ := setupTestServer(t)
+	mustDo(t, "PUT", srv.URL+"/mybucket", nil, nil).Body.Close()
+
+	resp := mustDo(t, "POST", srv.URL+"/mybucket/file.txt?uploads", nil, nil)
+	body := readBody(t, resp)
+	var initResult InitiateMultipartUploadResult
+	xml.Unmarshal([]byte(body), &initResult)
+	uploadID := initResult.UploadId
+
+	// Send malformed XML
+	completeResp := mustDo(t, "POST",
+		fmt.Sprintf("%s/mybucket/file.txt?uploadId=%s", srv.URL, uploadID),
+		strings.NewReader("not xml at all <<<<"), nil)
+	completeResp.Body.Close()
+	if completeResp.StatusCode != 400 {
+		t.Errorf("malformed XML: expected 400, got %d", completeResp.StatusCode)
+	}
+}
+
+func TestHTTPMultipartAbortInvalidUploadID(t *testing.T) {
+	srv, _ := setupTestServer(t)
+	mustDo(t, "PUT", srv.URL+"/mybucket", nil, nil).Body.Close()
+
+	resp := mustDo(t, "DELETE",
+		srv.URL+"/mybucket/file.txt?uploadId=nonexistent-id", nil, nil)
+	resp.Body.Close()
+	if resp.StatusCode != 404 {
+		t.Errorf("abort invalid uploadId: expected 404, got %d", resp.StatusCode)
+	}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Custom Metadata & Standard Headers – Handler Layer
+// ═══════════════════════════════════════════════════════════════════════════════
+
+func TestHTTPCustomMetadataHeaders(t *testing.T) {
+	srv, _ := setupTestServer(t)
+	mustDo(t, "PUT", srv.URL+"/mybucket", nil, nil).Body.Close()
+
+	// PUT with x-amz-meta-* headers
+	putResp := mustDo(t, "PUT", srv.URL+"/mybucket/meta.txt",
+		strings.NewReader("metadata test"), map[string]string{
+			"Content-Type":       "text/plain",
+			"x-amz-meta-author":  "alice",
+			"x-amz-meta-project": "geckos3",
+		})
+	putResp.Body.Close()
+	if putResp.StatusCode != 200 {
+		t.Fatalf("put with metadata: %d", putResp.StatusCode)
+	}
+
+	// GET should return the metadata headers
+	getResp := mustDo(t, "GET", srv.URL+"/mybucket/meta.txt", nil, nil)
+	readBody(t, getResp)
+	if getResp.Header.Get("x-amz-meta-author") != "alice" {
+		t.Errorf("GET x-amz-meta-author: %q", getResp.Header.Get("x-amz-meta-author"))
+	}
+	if getResp.Header.Get("x-amz-meta-project") != "geckos3" {
+		t.Errorf("GET x-amz-meta-project: %q", getResp.Header.Get("x-amz-meta-project"))
+	}
+
+	// HEAD should also return them
+	headResp := mustDo(t, "HEAD", srv.URL+"/mybucket/meta.txt", nil, nil)
+	headResp.Body.Close()
+	if headResp.Header.Get("x-amz-meta-author") != "alice" {
+		t.Errorf("HEAD x-amz-meta-author: %q", headResp.Header.Get("x-amz-meta-author"))
+	}
+	if headResp.Header.Get("x-amz-meta-project") != "geckos3" {
+		t.Errorf("HEAD x-amz-meta-project: %q", headResp.Header.Get("x-amz-meta-project"))
+	}
+}
+
+func TestHTTPStandardHeaders(t *testing.T) {
+	srv, _ := setupTestServer(t)
+	mustDo(t, "PUT", srv.URL+"/mybucket", nil, nil).Body.Close()
+
+	// Use a client that does NOT auto-decompress Content-Encoding: gzip
+	noDecompressClient := &http.Client{
+		Transport: &http.Transport{DisableCompression: true},
+	}
+	doRaw := func(method, url string, body io.Reader, headers map[string]string) *http.Response {
+		t.Helper()
+		req, err := http.NewRequest(method, url, body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+		resp, err := noDecompressClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp
+	}
+
+	// PUT with Content-Encoding, Content-Disposition, Cache-Control
+	putResp := doRaw("PUT", srv.URL+"/mybucket/compressed.js",
+		strings.NewReader("var x=1;"), map[string]string{
+			"Content-Type":        "application/javascript",
+			"Content-Encoding":    "gzip",
+			"Content-Disposition": "attachment; filename=\"app.js\"",
+			"Cache-Control":       "public, max-age=31536000",
+		})
+	putResp.Body.Close()
+	if putResp.StatusCode != 200 {
+		t.Fatalf("put with headers: %d", putResp.StatusCode)
+	}
+
+	// GET should return them
+	getResp := doRaw("GET", srv.URL+"/mybucket/compressed.js", nil, nil)
+	io.Copy(io.Discard, getResp.Body)
+	getResp.Body.Close()
+	if getResp.Header.Get("Content-Encoding") != "gzip" {
+		t.Errorf("GET Content-Encoding: %q", getResp.Header.Get("Content-Encoding"))
+	}
+	if getResp.Header.Get("Content-Disposition") != "attachment; filename=\"app.js\"" {
+		t.Errorf("GET Content-Disposition: %q", getResp.Header.Get("Content-Disposition"))
+	}
+	if getResp.Header.Get("Cache-Control") != "public, max-age=31536000" {
+		t.Errorf("GET Cache-Control: %q", getResp.Header.Get("Cache-Control"))
+	}
+
+	// HEAD should also return them
+	headResp := doRaw("HEAD", srv.URL+"/mybucket/compressed.js", nil, nil)
+	headResp.Body.Close()
+	if headResp.Header.Get("Content-Encoding") != "gzip" {
+		t.Errorf("HEAD Content-Encoding: %q", headResp.Header.Get("Content-Encoding"))
+	}
+	if headResp.Header.Get("Content-Disposition") != "attachment; filename=\"app.js\"" {
+		t.Errorf("HEAD Content-Disposition: %q", headResp.Header.Get("Content-Disposition"))
+	}
+	if headResp.Header.Get("Cache-Control") != "public, max-age=31536000" {
+		t.Errorf("HEAD Cache-Control: %q", headResp.Header.Get("Cache-Control"))
+	}
+}
+
+func TestHTTPNoStandardHeadersWhenNotSet(t *testing.T) {
+	srv, _ := setupTestServer(t)
+	mustDo(t, "PUT", srv.URL+"/mybucket", nil, nil).Body.Close()
+
+	mustDo(t, "PUT", srv.URL+"/mybucket/plain.txt",
+		strings.NewReader("no special headers"), nil).Body.Close()
+
+	headResp := mustDo(t, "HEAD", srv.URL+"/mybucket/plain.txt", nil, nil)
+	headResp.Body.Close()
+
+	// These should not be present when not set
+	if headResp.Header.Get("Content-Encoding") != "" {
+		t.Errorf("Content-Encoding should be absent: %q", headResp.Header.Get("Content-Encoding"))
+	}
+	if headResp.Header.Get("Content-Disposition") != "" {
+		t.Errorf("Content-Disposition should be absent: %q", headResp.Header.Get("Content-Disposition"))
+	}
+	if headResp.Header.Get("Cache-Control") != "" {
+		t.Errorf("Cache-Control should be absent: %q", headResp.Header.Get("Cache-Control"))
+	}
+}
+
+func TestHTTPMetadataOverwriteReplacesAll(t *testing.T) {
+	srv, _ := setupTestServer(t)
+	mustDo(t, "PUT", srv.URL+"/mybucket", nil, nil).Body.Close()
+
+	// First upload with key1
+	mustDo(t, "PUT", srv.URL+"/mybucket/evolve.txt",
+		strings.NewReader("v1"), map[string]string{
+			"x-amz-meta-key1": "val1",
+			"Cache-Control":   "no-cache",
+		}).Body.Close()
+
+	// Overwrite with key2 (key1 should disappear)
+	mustDo(t, "PUT", srv.URL+"/mybucket/evolve.txt",
+		strings.NewReader("v2"), map[string]string{
+			"x-amz-meta-key2": "val2",
+			"Cache-Control":   "max-age=600",
+		}).Body.Close()
+
+	headResp := mustDo(t, "HEAD", srv.URL+"/mybucket/evolve.txt", nil, nil)
+	headResp.Body.Close()
+
+	if headResp.Header.Get("x-amz-meta-key2") != "val2" {
+		t.Errorf("key2: %q", headResp.Header.Get("x-amz-meta-key2"))
+	}
+	if headResp.Header.Get("x-amz-meta-key1") != "" {
+		t.Errorf("key1 should be gone after overwrite: %q", headResp.Header.Get("x-amz-meta-key1"))
+	}
+	if headResp.Header.Get("Cache-Control") != "max-age=600" {
+		t.Errorf("Cache-Control: %q", headResp.Header.Get("Cache-Control"))
+	}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SHA256 Payload Verification – Handler Layer
+// ═══════════════════════════════════════════════════════════════════════════════
+
+func TestHTTPPayloadSHA256CorrectHash(t *testing.T) {
+	srv, _ := setupTestServer(t)
+	mustDo(t, "PUT", srv.URL+"/mybucket", nil, nil).Body.Close()
+
+	payload := []byte("verified payload content")
+	hash := sha256.Sum256(payload)
+	hashHex := hex.EncodeToString(hash[:])
+
+	resp := mustDo(t, "PUT", srv.URL+"/mybucket/verified.txt",
+		bytes.NewReader(payload), map[string]string{
+			"X-Amz-Content-Sha256": hashHex,
+		})
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Errorf("correct SHA256: expected 200, got %d", resp.StatusCode)
+	}
+
+	// Verify object exists and is correct
+	getResp := mustDo(t, "GET", srv.URL+"/mybucket/verified.txt", nil, nil)
+	body := readBody(t, getResp)
+	if body != "verified payload content" {
+		t.Errorf("content: %q", body)
+	}
+}
+
+func TestHTTPPayloadSHA256WrongHash(t *testing.T) {
+	srv, _ := setupTestServer(t)
+	mustDo(t, "PUT", srv.URL+"/mybucket", nil, nil).Body.Close()
+
+	payload := []byte("actual content")
+	// Send wrong hash
+	wrongHash := hex.EncodeToString(sha256.New().Sum(nil)) // hash of empty
+
+	resp := mustDo(t, "PUT", srv.URL+"/mybucket/bad-hash.txt",
+		bytes.NewReader(payload), map[string]string{
+			"X-Amz-Content-Sha256": wrongHash,
+		})
+	body := readBody(t, resp)
+	if resp.StatusCode != 400 {
+		t.Errorf("wrong SHA256: expected 400, got %d, body: %s", resp.StatusCode, body)
+	}
+
+	// Verify object was cleaned up (should not exist)
+	getResp := mustDo(t, "GET", srv.URL+"/mybucket/bad-hash.txt", nil, nil)
+	getResp.Body.Close()
+	if getResp.StatusCode != 404 {
+		t.Errorf("after bad digest, object should be gone, got %d", getResp.StatusCode)
+	}
+}
+
+func TestHTTPPayloadSHA256UnsignedPayloadSkipsVerification(t *testing.T) {
+	srv, _ := setupTestServer(t)
+	mustDo(t, "PUT", srv.URL+"/mybucket", nil, nil).Body.Close()
+
+	resp := mustDo(t, "PUT", srv.URL+"/mybucket/unsigned.txt",
+		strings.NewReader("any content"), map[string]string{
+			"X-Amz-Content-Sha256": "UNSIGNED-PAYLOAD",
+		})
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Errorf("UNSIGNED-PAYLOAD: expected 200, got %d", resp.StatusCode)
+	}
+}
+
+func TestHTTPPayloadSHA256StreamingSkipsVerification(t *testing.T) {
+	srv, _ := setupTestServer(t)
+	mustDo(t, "PUT", srv.URL+"/mybucket", nil, nil).Body.Close()
+
+	resp := mustDo(t, "PUT", srv.URL+"/mybucket/streaming.txt",
+		strings.NewReader("streaming content"), map[string]string{
+			"X-Amz-Content-Sha256": "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+		})
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Errorf("streaming signature: expected 200, got %d", resp.StatusCode)
+	}
+}
+
+func TestHTTPPayloadSHA256EmptyBody(t *testing.T) {
+	srv, _ := setupTestServer(t)
+	mustDo(t, "PUT", srv.URL+"/mybucket", nil, nil).Body.Close()
+
+	// SHA256 of empty string
+	hash := sha256.Sum256([]byte{})
+	hashHex := hex.EncodeToString(hash[:])
+
+	resp := mustDo(t, "PUT", srv.URL+"/mybucket/empty-verified.txt",
+		bytes.NewReader(nil), map[string]string{
+			"X-Amz-Content-Sha256": hashHex,
+		})
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Errorf("empty body with correct SHA256: expected 200, got %d", resp.StatusCode)
+	}
+}
+
+func TestHTTPPayloadNoSHA256HeaderSkipsVerification(t *testing.T) {
+	srv, _ := setupTestServer(t)
+	mustDo(t, "PUT", srv.URL+"/mybucket", nil, nil).Body.Close()
+
+	// No X-Amz-Content-Sha256 header at all — should succeed without verification
+	resp := mustDo(t, "PUT", srv.URL+"/mybucket/no-sha.txt",
+		strings.NewReader("no verification"), nil)
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Errorf("no SHA256 header: expected 200, got %d", resp.StatusCode)
+	}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Multipart Upload – E2E combining multiple handler operations
+// ═══════════════════════════════════════════════════════════════════════════════
+
+func TestHTTPMultipartUploadThenList(t *testing.T) {
+	srv, _ := setupTestServer(t)
+	mustDo(t, "PUT", srv.URL+"/mybucket", nil, nil).Body.Close()
+
+	// Create and complete a multipart upload
+	resp := mustDo(t, "POST", srv.URL+"/mybucket/listed.txt?uploads", nil, nil)
+	body := readBody(t, resp)
+	var initResult InitiateMultipartUploadResult
+	xml.Unmarshal([]byte(body), &initResult)
+	uploadID := initResult.UploadId
+
+	partResp := mustDo(t, "PUT",
+		fmt.Sprintf("%s/mybucket/listed.txt?partNumber=1&uploadId=%s", srv.URL, uploadID),
+		strings.NewReader("listed-data"), nil)
+	partResp.Body.Close()
+	etag := partResp.Header.Get("ETag")
+
+	completeXML := fmt.Sprintf(
+		`<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>%s</ETag></Part></CompleteMultipartUpload>`, etag)
+	mustDo(t, "POST",
+		fmt.Sprintf("%s/mybucket/listed.txt?uploadId=%s", srv.URL, uploadID),
+		strings.NewReader(completeXML), nil).Body.Close()
+
+	// List should include the object
+	listResp := mustDo(t, "GET", srv.URL+"/mybucket?list-type=2", nil, nil)
+	listBody := readBody(t, listResp)
+	var result ListBucketResult
+	xml.Unmarshal([]byte(listBody), &result)
+
+	found := false
+	for _, obj := range result.Contents {
+		if obj.Key == "listed.txt" {
+			found = true
+			if obj.Size != 11 {
+				t.Errorf("size: %d", obj.Size)
+			}
+		}
+	}
+	if !found {
+		t.Error("multipart object should appear in listing")
+	}
+}
+
+func TestHTTPMultipartUploadThenDelete(t *testing.T) {
+	srv, _ := setupTestServer(t)
+	mustDo(t, "PUT", srv.URL+"/mybucket", nil, nil).Body.Close()
+
+	// Complete a multipart upload
+	resp := mustDo(t, "POST", srv.URL+"/mybucket/deletable.txt?uploads", nil, nil)
+	body := readBody(t, resp)
+	var initResult InitiateMultipartUploadResult
+	xml.Unmarshal([]byte(body), &initResult)
+	uploadID := initResult.UploadId
+
+	partResp := mustDo(t, "PUT",
+		fmt.Sprintf("%s/mybucket/deletable.txt?partNumber=1&uploadId=%s", srv.URL, uploadID),
+		strings.NewReader("temp"), nil)
+	partResp.Body.Close()
+	etag := partResp.Header.Get("ETag")
+
+	completeXML := fmt.Sprintf(
+		`<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>%s</ETag></Part></CompleteMultipartUpload>`, etag)
+	mustDo(t, "POST",
+		fmt.Sprintf("%s/mybucket/deletable.txt?uploadId=%s", srv.URL, uploadID),
+		strings.NewReader(completeXML), nil).Body.Close()
+
+	// Delete it
+	delResp := mustDo(t, "DELETE", srv.URL+"/mybucket/deletable.txt", nil, nil)
+	delResp.Body.Close()
+	if delResp.StatusCode != 204 {
+		t.Errorf("delete: %d", delResp.StatusCode)
+	}
+
+	// Verify gone
+	getResp := mustDo(t, "GET", srv.URL+"/mybucket/deletable.txt", nil, nil)
+	getResp.Body.Close()
+	if getResp.StatusCode != 404 {
+		t.Errorf("after delete: expected 404, got %d", getResp.StatusCode)
+	}
+}
+
+func TestHTTPPostObjectWithoutUploadsOrUploadId(t *testing.T) {
+	srv, _ := setupTestServer(t)
+	mustDo(t, "PUT", srv.URL+"/mybucket", nil, nil).Body.Close()
+
+	// POST to object without ?uploads or ?uploadId should 501
+	resp := mustDo(t, "POST", srv.URL+"/mybucket/file.txt",
+		strings.NewReader("irrelevant"), nil)
+	resp.Body.Close()
+	if resp.StatusCode != 501 {
+		t.Errorf("POST without multipart params: expected 501, got %d", resp.StatusCode)
 	}
 }

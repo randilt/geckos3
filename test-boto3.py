@@ -78,14 +78,9 @@ def main():
 
         # Delete objects
         print("\n==> Deleting objects...")
-        objects_to_delete = [
-            'test-file.txt',
-            'dir1/file1.txt',
-            'dir1/file2.txt',
-            'dir2/file3.txt'
-        ]
-        for key in objects_to_delete:
-            s3.delete_object(Bucket=BUCKET, Key=key)
+        response = s3.list_objects_v2(Bucket=BUCKET)
+        for obj in response.get('Contents', []):
+            s3.delete_object(Bucket=BUCKET, Key=obj['Key'])
         print("✓ Objects deleted")
 
         # Delete bucket

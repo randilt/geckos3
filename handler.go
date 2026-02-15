@@ -2,9 +2,12 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/xml"
 	"fmt"
+	"hash"
 	"io"
 	"net/http"
 	"sort"
@@ -18,7 +21,8 @@ type S3Handler struct {
 	auth    Authenticator
 }
 
-// MaxClientsMiddleware limits concurrent requests using a semaphore
+// MaxClientsMiddleware limits concurrent in-flight HTTP operations using a
+// buffered-channel semaphore to protect file descriptor limits.
 func MaxClientsMiddleware(maxClients int) func(http.Handler) http.Handler {
 	semaphore := make(chan struct{}, maxClients)
 
@@ -57,7 +61,6 @@ func (h *S3Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Route based on method and path
 	if bucket == "" {
-		// Service-level operations
 		if r.Method == http.MethodGet {
 			h.handleListBuckets(w, r)
 		} else {
@@ -67,10 +70,8 @@ func (h *S3Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if key == "" {
-		// Bucket operations
 		h.handleBucketOperation(w, r, bucket)
 	} else {
-		// Object operations
 		h.handleObjectOperation(w, r, bucket, key)
 	}
 }
@@ -84,7 +85,6 @@ func (h *S3Handler) handleBucketOperation(w http.ResponseWriter, r *http.Request
 	case http.MethodHead:
 		h.handleHeadBucket(w, r, bucket)
 	case http.MethodPost:
-		// POST /{bucket}?delete = DeleteObjects
 		if r.URL.Query().Has("delete") {
 			h.handleDeleteObjects(w, r, bucket)
 		} else {
@@ -102,33 +102,62 @@ func (h *S3Handler) handleBucketOperation(w http.ResponseWriter, r *http.Request
 }
 
 func (h *S3Handler) handleObjectOperation(w http.ResponseWriter, r *http.Request, bucket, key string) {
+	query := r.URL.Query()
+
 	switch r.Method {
+	case http.MethodPost:
+		// POST /{bucket}/{key}?uploads → CreateMultipartUpload
+		if query.Has("uploads") {
+			h.handleCreateMultipartUpload(w, r, bucket, key)
+			return
+		}
+		// POST /{bucket}/{key}?uploadId=X → CompleteMultipartUpload
+		if query.Has("uploadId") {
+			h.handleCompleteMultipartUpload(w, r, bucket, key)
+			return
+		}
+		h.writeError(w, r, "NotImplemented", "Operation not supported", http.StatusNotImplemented)
+
 	case http.MethodPut:
-		// CopyObject if x-amz-copy-source is present
+		// PUT /{bucket}/{key}?partNumber=N&uploadId=X → UploadPart
+		if query.Has("partNumber") && query.Has("uploadId") {
+			h.handleUploadPart(w, r, bucket, key)
+			return
+		}
 		if copySource := r.Header.Get("x-amz-copy-source"); copySource != "" {
 			h.handleCopyObject(w, r, bucket, key, copySource)
 		} else {
 			h.handlePutObject(w, r, bucket, key)
 		}
+
 	case http.MethodGet:
 		h.handleGetObject(w, r, bucket, key)
 	case http.MethodHead:
 		h.handleHeadObject(w, r, bucket, key)
+
 	case http.MethodDelete:
+		// DELETE /{bucket}/{key}?uploadId=X → AbortMultipartUpload
+		if query.Has("uploadId") {
+			h.handleAbortMultipartUpload(w, r, bucket, key)
+			return
+		}
 		h.handleDeleteObject(w, r, bucket, key)
+
 	default:
 		h.writeError(w, r, "MethodNotAllowed", "Method not allowed", http.StatusMethodNotAllowed)
 	}
 }
 
-// Bucket handlers
+// ═══════════════════════════════════════════════════════════════════════════════
+// Bucket Handlers
+// ═══════════════════════════════════════════════════════════════════════════════
+
 func (h *S3Handler) handleCreateBucket(w http.ResponseWriter, r *http.Request, bucket string) {
 	if !isValidBucketName(bucket) {
 		h.writeError(w, r, "InvalidBucketName", "The specified bucket is not valid", http.StatusBadRequest)
 		return
 	}
 
-	// S3-1: Return appropriate status if bucket already exists
 	if h.storage.BucketExists(bucket) {
 		w.Header().Set("Location", "/"+bucket)
 		w.WriteHeader(http.StatusOK)
@@ -173,7 +202,6 @@ func (h *S3Handler) handleListObjectsV2(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
-	// Parse query parameters
 	prefix := r.URL.Query().Get("prefix")
 	delimiter := r.URL.Query().Get("delimiter")
 	startAfter := r.URL.Query().Get("start-after")
@@ -188,7 +216,6 @@ func (h *S3Handler) handleListObjectsV2(w http.ResponseWriter, r *http.Request, 
 		maxKeys = 10000
 	}
 
-	// Decode continuation token (base64-encoded last key)
 	startKey := startAfter
 	if continuationToken != "" {
 		if decoded, err := base64.StdEncoding.DecodeString(continuationToken); err == nil {
@@ -196,19 +223,16 @@ func (h *S3Handler) handleListObjectsV2(w http.ResponseWriter, r *http.Request, 
 		}
 	}
 
-	// Get all matching objects for correct pagination
 	objects, err := h.storage.ListObjects(bucket, prefix, 0)
 	if err != nil {
 		h.writeError(w, r, "InternalError", err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	// Sort by key (S3 returns lexicographically sorted results)
 	sort.Slice(objects, func(i, j int) bool {
 		return objects[i].Key < objects[j].Key
 	})
 
-	// Apply start-after or continuation-token
 	if startKey != "" {
 		idx := sort.Search(len(objects), func(i int) bool {
 			return objects[i].Key > startKey
@@ -216,7 +240,6 @@ func (h *S3Handler) handleListObjectsV2(w http.ResponseWriter, r *http.Request, 
 		objects = objects[idx:]
 	}
 
-	// Apply delimiter grouping and maxKeys
 	isTruncated := false
 	var nextToken string
 	var commonPrefixes []CommonPrefix
@@ -255,7 +278,6 @@ func (h *S3Handler) handleListObjectsV2(w http.ResponseWriter, r *http.Request, 
 		}
 		objects = filteredObjects
 	} else {
-		// No delimiter: simple maxKeys truncation
 		if maxKeys == 0 {
 			objects = nil
 		} else if len(objects) > maxKeys {
@@ -265,7 +287,6 @@ func (h *S3Handler) handleListObjectsV2(w http.ResponseWriter, r *http.Request, 
 		}
 	}
 
-	// Build XML response
 	keyCount := len(objects) + len(commonPrefixes)
 	response := ListBucketResult{
 		Xmlns:                 "http://s3.amazonaws.com/doc/2006-03-01/",
@@ -295,18 +316,62 @@ func (h *S3Handler) handleListObjectsV2(w http.ResponseWriter, r *http.Request, 
 	h.writeXML(w, http.StatusOK, response)
 }
 
-// Object handlers
+// ═══════════════════════════════════════════════════════════════════════════════
+// Object Handlers
+// ═══════════════════════════════════════════════════════════════════════════════
+
 func (h *S3Handler) handlePutObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
 	if !h.storage.BucketExists(bucket) {
 		h.writeError(w, r, "NoSuchBucket", "The specified bucket does not exist", http.StatusNotFound)
 		return
 	}
 
-	contentType := r.Header.Get("Content-Type")
-	metadata, err := h.storage.PutObject(bucket, key, r.Body, contentType)
+	// Build PutObjectInput from request headers
+	input := &PutObjectInput{
+		ContentType:        r.Header.Get("Content-Type"),
+		ContentEncoding:    r.Header.Get("Content-Encoding"),
+		ContentDisposition: r.Header.Get("Content-Disposition"),
+		CacheControl:       r.Header.Get("Cache-Control"),
+	}
+
+	// Parse x-amz-meta-* custom metadata headers
+	customMeta := make(map[string]string)
+	for name, values := range r.Header {
+		lower := strings.ToLower(name)
+		if strings.HasPrefix(lower, "x-amz-meta-") && len(values) > 0 {
+			metaKey := strings.TrimPrefix(lower, "x-amz-meta-")
+			customMeta[metaKey] = values[0]
+		}
+	}
+	if len(customMeta) > 0 {
+		input.CustomMetadata = customMeta
+	}
+
+	// Payload hash verification: if the client sent a real SHA256 (not UNSIGNED-PAYLOAD),
+	// wrap the body in a TeeReader to compute the digest on-the-fly.
+	var bodyReader io.Reader = r.Body
+	var sha256Hasher hash.Hash
+	expectedSHA := r.Header.Get("X-Amz-Content-Sha256")
+	if expectedSHA != "" && expectedSHA != "UNSIGNED-PAYLOAD" && expectedSHA != "STREAMING-AWS4-HMAC-SHA256-PAYLOAD" {
+		sha256Hasher = sha256.New()
+		bodyReader = io.TeeReader(r.Body, sha256Hasher)
+	}
+
+	metadata, err := h.storage.PutObject(bucket, key, bodyReader, input)
 	if err != nil {
 		h.writeError(w, r, "InternalError", err.Error(), http.StatusInternalServerError)
 		return
+	}
+
+	// Verify SHA256 if we computed it
+	if sha256Hasher != nil {
+		computed := hex.EncodeToString(sha256Hasher.Sum(nil))
+		if computed != expectedSHA {
+			// Payload mismatch: the file was already written, remove it
+			h.storage.DeleteObject(bucket, key)
+			h.writeError(w, r, "BadDigest", "The Content-SHA256 you specified did not match what we received", http.StatusBadRequest)
+			return
+		}
 	}
 
 	w.Header().Set("ETag", metadata.ETag)
@@ -321,15 +386,33 @@ func (h *S3Handler) handleGetObject(w http.ResponseWriter, r *http.Request, buck
 	}
 	defer reader.Close()
 
-	// Set headers before ServeContent
+	// Set ETag
 	if metadata.ETag != "" {
 		w.Header().Set("ETag", metadata.ETag)
 	}
+
+	// Set Content-Type
 	ct := metadata.ContentType
 	if ct == "" {
 		ct = "application/octet-stream"
 	}
 	w.Header().Set("Content-Type", ct)
+
+	// Emit stored standard headers
+	if metadata.ContentEncoding != "" {
+		w.Header().Set("Content-Encoding", metadata.ContentEncoding)
+	}
+	if metadata.ContentDisposition != "" {
+		w.Header().Set("Content-Disposition", metadata.ContentDisposition)
+	}
+	if metadata.CacheControl != "" {
+		w.Header().Set("Cache-Control", metadata.CacheControl)
+	}
+
+	// Emit custom x-amz-meta-* headers
+	for k, v := range metadata.CustomMetadata {
+		w.Header().Set("x-amz-meta-"+k, v)
+	}
 
 	// Use http.ServeContent for automatic Range request support
 	if rs, ok := reader.(io.ReadSeeker); ok {
@@ -361,6 +444,22 @@ func (h *S3Handler) handleHeadObject(w http.ResponseWriter, r *http.Request, buc
 	w.Header().Set("ETag", metadata.ETag)
 	w.Header().Set("Accept-Ranges", "bytes")
 
+	// Emit stored standard headers
+	if metadata.ContentEncoding != "" {
+		w.Header().Set("Content-Encoding", metadata.ContentEncoding)
+	}
+	if metadata.ContentDisposition != "" {
+		w.Header().Set("Content-Disposition", metadata.ContentDisposition)
+	}
+	if metadata.CacheControl != "" {
+		w.Header().Set("Cache-Control", metadata.CacheControl)
+	}
+
+	// Emit custom x-amz-meta-* headers
+	for k, v := range metadata.CustomMetadata {
+		w.Header().Set("x-amz-meta-"+k, v)
+	}
+
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -373,7 +472,10 @@ func (h *S3Handler) handleDeleteObject(w http.ResponseWriter, r *http.Request, b
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// ListBuckets handler
+// ═══════════════════════════════════════════════════════════════════════════════
+// ListBuckets Handler
+// ═══════════════════════════════════════════════════════════════════════════════
+
 func (h *S3Handler) handleListBuckets(w http.ResponseWriter, r *http.Request) {
 	buckets, err := h.storage.ListBuckets()
 	if err != nil {
@@ -397,7 +499,10 @@ func (h *S3Handler) handleListBuckets(w http.ResponseWriter, r *http.Request) {
 	h.writeXML(w, http.StatusOK, response)
 }
 
-// ListObjectsV1 handler
+// ═══════════════════════════════════════════════════════════════════════════════
+// ListObjectsV1 Handler
+// ═══════════════════════════════════════════════════════════════════════════════
+
 func (h *S3Handler) handleListObjectsV1(w http.ResponseWriter, r *http.Request, bucket string) {
 	if !h.storage.BucketExists(bucket) {
 		h.writeError(w, r, "NoSuchBucket", "The specified bucket does not exist", http.StatusNotFound)
@@ -427,7 +532,6 @@ func (h *S3Handler) handleListObjectsV1(w http.ResponseWriter, r *http.Request, 
 		return objects[i].Key < objects[j].Key
 	})
 
-	// Apply marker
 	if marker != "" {
 		idx := sort.Search(len(objects), func(i int) bool {
 			return objects[i].Key > marker
@@ -505,9 +609,11 @@ func (h *S3Handler) handleListObjectsV1(w http.ResponseWriter, r *http.Request, 
 	h.writeXML(w, http.StatusOK, response)
 }
 
-// CopyObject handler
+// ═══════════════════════════════════════════════════════════════════════════════
+// CopyObject Handler
+// ═══════════════════════════════════════════════════════════════════════════════
+
 func (h *S3Handler) handleCopyObject(w http.ResponseWriter, r *http.Request, dstBucket, dstKey, copySource string) {
-	// Parse source: /bucket/key or bucket/key
 	copySource = strings.TrimPrefix(copySource, "/")
 	parts := strings.SplitN(copySource, "/", 2)
 	if len(parts) < 2 || parts[1] == "" {
@@ -540,15 +646,17 @@ func (h *S3Handler) handleCopyObject(w http.ResponseWriter, r *http.Request, dst
 	h.writeXML(w, http.StatusOK, response)
 }
 
-// DeleteObjects (batch) handler
+// ═══════════════════════════════════════════════════════════════════════════════
+// DeleteObjects (Batch) Handler
+// ═══════════════════════════════════════════════════════════════════════════════
+
 func (h *S3Handler) handleDeleteObjects(w http.ResponseWriter, r *http.Request, bucket string) {
 	if !h.storage.BucketExists(bucket) {
 		h.writeError(w, r, "NoSuchBucket", "The specified bucket does not exist", http.StatusNotFound)
 		return
 	}
 
-	// Parse request body
-	body, err := io.ReadAll(io.LimitReader(r.Body, 1*1024*1024)) // 1MB limit (reduced from 10MB)
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1*1024*1024)) // 1MB limit
 	if err != nil {
 		h.writeError(w, r, "InternalError", "Failed to read request body", http.StatusInternalServerError)
 		return
@@ -586,9 +694,114 @@ func (h *S3Handler) handleDeleteObjects(w http.ResponseWriter, r *http.Request, 
 	h.writeXML(w, http.StatusOK, response)
 }
 
-// Helper functions
+// ═══════════════════════════════════════════════════════════════════════════════
+// Multipart Upload Handlers
+// ═══════════════════════════════════════════════════════════════════════════════
+
+func (h *S3Handler) handleCreateMultipartUpload(w http.ResponseWriter, r *http.Request, bucket, key string) {
+	if !h.storage.BucketExists(bucket) {
+		h.writeError(w, r, "NoSuchBucket", "The specified bucket does not exist", http.StatusNotFound)
+		return
+	}
+
+	contentType := r.Header.Get("Content-Type")
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+
+	uploadID, err := h.storage.CreateMultipartUpload(bucket, key, contentType)
+	if err != nil {
+		h.writeError(w, r, "InternalError", err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	response := InitiateMultipartUploadResult{
+		Xmlns:    "http://s3.amazonaws.com/doc/2006-03-01/",
+		Bucket:   bucket,
+		Key:      key,
+		UploadId: uploadID,
+	}
+
+	h.writeXML(w, http.StatusOK, response)
+}
+
+func (h *S3Handler) handleUploadPart(w http.ResponseWriter, r *http.Request, bucket, key string) {
+	query := r.URL.Query()
+	uploadID := query.Get("uploadId")
+	partNumStr := query.Get("partNumber")
+
+	partNumber, err := strconv.Atoi(partNumStr)
+	if err != nil || partNumber < 1 || partNumber > 10000 {
+		h.writeError(w, r, "InvalidArgument", "Invalid part number", http.StatusBadRequest)
+		return
+	}
+
+	etag, err := h.storage.UploadPart(bucket, key, uploadID, partNumber, r.Body)
+	if err != nil {
+		h.writeError(w, r, "NoSuchUpload", err.Error(), http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("ETag", etag)
+	w.WriteHeader(http.StatusOK)
+}
+
+func (h *S3Handler) handleCompleteMultipartUpload(w http.ResponseWriter, r *http.Request, bucket, key string) {
+	uploadID := r.URL.Query().Get("uploadId")
+
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1*1024*1024))
+	if err != nil {
+		h.writeError(w, r, "InternalError", "Failed to read request body", http.StatusInternalServerError)
+		return
+	}
+
+	var completeReq CompleteMultipartUploadRequest
+	if err := xml.Unmarshal(body, &completeReq); err != nil {
+		h.writeError(w, r, "MalformedXML", "The XML you provided was not well-formed", http.StatusBadRequest)
+		return
+	}
+
+	// Convert XML parts to storage parts
+	parts := make([]CompletedPart, len(completeReq.Parts))
+	for i, p := range completeReq.Parts {
+		parts[i] = CompletedPart{
+			PartNumber: p.PartNumber,
+			ETag:       p.ETag,
+		}
+	}
+
+	metadata, err := h.storage.CompleteMultipartUpload(bucket, key, uploadID, parts)
+	if err != nil {
+		h.writeError(w, r, "InternalError", err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	response := CompleteMultipartUploadResultXML{
+		Xmlns:  "http://s3.amazonaws.com/doc/2006-03-01/",
+		Bucket: bucket,
+		Key:    key,
+		ETag:   metadata.ETag,
+	}
+
+	h.writeXML(w, http.StatusOK, response)
+}
+
+func (h *S3Handler) handleAbortMultipartUpload(w http.ResponseWriter, r *http.Request, bucket, key string) {
+	uploadID := r.URL.Query().Get("uploadId")
+
+	if err := h.storage.AbortMultipartUpload(bucket, key, uploadID); err != nil {
+		h.writeError(w, r, "NoSuchUpload", err.Error(), http.StatusNotFound)
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Helper Functions
+// ═══════════════════════════════════════════════════════════════════════════════
+
 func (h *S3Handler) parsePath(path string) (bucket, key string) {
-	// Remove leading slash
 	path = strings.TrimPrefix(path, "/")
 
 	if path == "" {
@@ -606,7 +819,6 @@ func (h *S3Handler) parsePath(path string) (bucket, key string) {
 }
 
 func (h *S3Handler) writeError(w http.ResponseWriter, r *http.Request, code, message string, status int) {
-	// Store error in request context for logging
 	ctx := context.WithValue(r.Context(), errorContextKey, fmt.Sprintf("%s: %s", code, message))
 	*r = *r.WithContext(ctx)
 
@@ -618,7 +830,6 @@ func (h *S3Handler) writeError(w http.ResponseWriter, r *http.Request, code, mes
 	h.writeXML(w, status, errorResponse)
 }
 
-// writeXML writes an XML response with the standard XML declaration.
 func (h *S3Handler) writeXML(w http.ResponseWriter, status int, v interface{}) {
 	w.Header().Set("Content-Type", "application/xml")
 	w.WriteHeader(status)
@@ -644,7 +855,10 @@ func isValidBucketName(name string) bool {
 	return true
 }
 
-// XML response structures
+// ═══════════════════════════════════════════════════════════════════════════════
+// XML Response/Request Structures
+// ═══════════════════════════════════════════════════════════════════════════════
+
 type ListBucketResult struct {
 	XMLName               xml.Name       `xml:"ListBucketResult"`
 	Xmlns                 string         `xml:"xmlns,attr"`
@@ -679,7 +893,6 @@ type ErrorResponse struct {
 	Message string   `xml:"Message"`
 }
 
-// ListBuckets XML types
 type ListAllMyBucketsResult struct {
 	XMLName xml.Name   `xml:"ListAllMyBucketsResult"`
 	Xmlns   string     `xml:"xmlns,attr"`
@@ -695,7 +908,6 @@ type XMLBucket struct {
 	CreationDate string `xml:"CreationDate"`
 }
 
-// ListObjectsV1 XML type
 type ListBucketResultV1 struct {
 	XMLName        xml.Name       `xml:"ListBucketResult"`
 	Xmlns          string         `xml:"xmlns,attr"`
@@ -710,14 +922,12 @@ type ListBucketResultV1 struct {
 	CommonPrefixes []CommonPrefix `xml:"CommonPrefixes,omitempty"`
 }
 
-// CopyObject XML type
 type CopyObjectResult struct {
 	XMLName      xml.Name `xml:"CopyObjectResult"`
 	LastModified string   `xml:"LastModified"`
 	ETag         string   `xml:"ETag"`
 }
 
-// DeleteObjects XML types
 type DeleteRequest struct {
 	XMLName xml.Name            `xml:"Delete"`
 	Quiet   bool                `xml:"Quiet"`
@@ -743,4 +953,32 @@ type DeleteError struct {
 	Key     string `xml:"Key"`
 	Code    string `xml:"Code"`
 	Message string `xml:"Message"`
+}
+
+// Multipart upload XML types
+
+type InitiateMultipartUploadResult struct {
+	XMLName  xml.Name `xml:"InitiateMultipartUploadResult"`
+	Xmlns    string   `xml:"xmlns,attr"`
+	Bucket   string   `xml:"Bucket"`
+	Key      string   `xml:"Key"`
+	UploadId string   `xml:"UploadId"`
+}
+
+type CompleteMultipartUploadRequest struct {
+	XMLName xml.Name           `xml:"CompleteMultipartUpload"`
+	Parts   []CompletedPartXML `xml:"Part"`
+}
+
+type CompletedPartXML struct {
+	PartNumber int    `xml:"PartNumber"`
+	ETag       string `xml:"ETag"`
+}
+
+type CompleteMultipartUploadResultXML struct {
+	XMLName xml.Name `xml:"CompleteMultipartUploadResult"`
+	Xmlns   string   `xml:"xmlns,attr"`
+	Bucket  string   `xml:"Bucket"`
+	Key     string   `xml:"Key"`
+	ETag    string   `xml:"ETag"`
 }

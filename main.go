@@ -75,6 +75,8 @@ func main() {
 		Addr:              config.ListenAddr,
 		Handler:           loggedHandler,
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       6 * time.Hour,
+		WriteTimeout:      6 * time.Hour,
 		IdleTimeout:       120 * time.Second,
 	}
 
