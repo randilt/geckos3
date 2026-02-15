@@ -34,8 +34,8 @@ Download the latest release for your platform from [GitHub Releases](https://git
 **Linux (x86_64):**
 
 ```bash
-wget https://github.com/randilt/geckos3/releases/download/v0.3.0/geckos3_0.3.0_Linux_x86_64.tar.gz
-tar -xzf geckos3_0.3.0_Linux_x86_64.tar.gz
+wget https://github.com/randilt/geckos3/releases/download/v0.4.0/geckos3_0.4.0_Linux_x86_64.tar.gz
+tar -xzf geckos3_0.4.0_Linux_x86_64.tar.gz
 chmod +x geckos3
 ./geckos3
 ```
@@ -43,8 +43,8 @@ chmod +x geckos3
 **macOS (Apple Silicon):**
 
 ```bash
-wget https://github.com/randilt/geckos3/releases/download/v0.3.0/geckos3_0.3.0_Darwin_arm64.tar.gz
-tar -xzf geckos3_0.3.0_Darwin_arm64.tar.gz
+wget https://github.com/randilt/geckos3/releases/download/v0.4.0/geckos3_0.4.0_Darwin_arm64.tar.gz
+tar -xzf geckos3_0.4.0_Darwin_arm64.tar.gz
 chmod +x geckos3
 ./geckos3
 ```
@@ -52,8 +52,8 @@ chmod +x geckos3
 **macOS (Intel):**
 
 ```bash
-wget https://github.com/randilt/geckos3/releases/download/v0.3.0/geckos3_0.3.0_Darwin_x86_64.tar.gz
-tar -xzf geckos3_0.3.0_Darwin_x86_64.tar.gz
+wget https://github.com/randilt/geckos3/releases/download/v0.4.0/geckos3_0.4.0_Darwin_x86_64.tar.gz
+tar -xzf geckos3_0.4.0_Darwin_x86_64.tar.gz
 chmod +x geckos3
 ./geckos3
 ```
@@ -61,7 +61,7 @@ chmod +x geckos3
 **Windows (PowerShell):**
 
 ```powershell
-Invoke-WebRequest -Uri "https://github.com/randilt/geckos3/releases/download/v0.3.0/geckos3_0.3.0_Windows_x86_64.tar.gz" -OutFile "geckos3.tar.gz"
+Invoke-WebRequest -Uri "https://github.com/randilt/geckos3/releases/download/v0.4.0/geckos3_0.4.0_Windows_x86_64.tar.gz" -OutFile "geckos3.tar.gz"
 tar -xzf geckos3.tar.gz
 .\geckos3.exe
 ```
@@ -219,7 +219,7 @@ s3.upload_file("large-file.bin", "mybucket", "large-file.bin")
 docker pull randiltharusha/geckos3:latest
 
 # Specific version
-docker pull randiltharusha/geckos3:v0.3.0
+docker pull randiltharusha/geckos3:v0.4.0
 ```
 
 ### Run Container
