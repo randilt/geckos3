@@ -231,4 +231,4 @@ make lint            Run go vet
 
 ## License
 
-MIT
+Apache 2.0 - See [LICENSE](LICENSE) for details.
