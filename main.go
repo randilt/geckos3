@@ -41,8 +41,12 @@ func main() {
 	var auth Authenticator
 	if config.AuthEnabled {
 		auth = NewSigV4Authenticator(config.AccessKey, config.SecretKey)
+		if config.AccessKey == "minioadmin" || config.SecretKey == "minioadmin" {
+			log.Println("WARNING: Using default credentials. Set S3LITE_ACCESS_KEY and S3LITE_SECRET_KEY for production use.")
+		}
 	} else {
 		auth = &NoOpAuthenticator{}
+		log.Println("WARNING: Authentication is disabled. All requests will be accepted.")
 	}
 
 	// Initialize handler

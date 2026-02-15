@@ -12,11 +12,11 @@ import (
 )
 
 type S3Handler struct {
-	storage *FilesystemStorage
+	storage Storage
 	auth    Authenticator
 }
 
-func NewS3Handler(storage *FilesystemStorage, auth Authenticator) *S3Handler {
+func NewS3Handler(storage Storage, auth Authenticator) *S3Handler {
 	return &S3Handler{
 		storage: storage,
 		auth:    auth,
@@ -24,6 +24,13 @@ func NewS3Handler(storage *FilesystemStorage, auth Authenticator) *S3Handler {
 }
 
 func (h *S3Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Health check endpoint (bypasses auth)
+	if r.URL.Path == "/health" && r.Method == http.MethodGet {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("OK"))
+		return
+	}
+
 	// Authenticate request
 	if err := h.auth.Authenticate(r); err != nil {
 		h.writeError(w, "AccessDenied", err.Error(), http.StatusForbidden)
@@ -91,6 +98,13 @@ func (h *S3Handler) handleCreateBucket(w http.ResponseWriter, r *http.Request, b
 		return
 	}
 
+	// S3-1: Return appropriate status if bucket already exists
+	if h.storage.BucketExists(bucket) {
+		w.Header().Set("Location", "/"+bucket)
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
 	if err := h.storage.CreateBucket(bucket); err != nil {
 		h.writeError(w, "InternalError", err.Error(), http.StatusInternalServerError)
 		return
@@ -131,6 +145,7 @@ func (h *S3Handler) handleListObjectsV2(w http.ResponseWriter, r *http.Request, 
 
 	// Parse query parameters
 	prefix := r.URL.Query().Get("prefix")
+	delimiter := r.URL.Query().Get("delimiter")
 	startAfter := r.URL.Query().Get("start-after")
 	continuationToken := r.URL.Query().Get("continuation-token")
 	maxKeys := 1000
@@ -171,27 +186,67 @@ func (h *S3Handler) handleListObjectsV2(w http.ResponseWriter, r *http.Request, 
 		objects = objects[idx:]
 	}
 
-	// Apply maxKeys limit and determine truncation
+	// Apply delimiter grouping and maxKeys
 	isTruncated := false
 	var nextToken string
-	if maxKeys == 0 {
-		objects = nil
-	} else if len(objects) > maxKeys {
-		isTruncated = true
-		nextToken = base64.StdEncoding.EncodeToString([]byte(objects[maxKeys-1].Key))
-		objects = objects[:maxKeys]
+	var commonPrefixes []CommonPrefix
+
+	if delimiter != "" {
+		seenPrefixes := make(map[string]bool)
+		var filteredObjects []ObjectInfo
+		totalCount := 0
+		lastKey := ""
+
+		for _, obj := range objects {
+			if maxKeys > 0 && totalCount >= maxKeys {
+				isTruncated = true
+				break
+			}
+
+			rest := strings.TrimPrefix(obj.Key, prefix)
+			idx := strings.Index(rest, delimiter)
+			if idx >= 0 {
+				cp := prefix + rest[:idx+len(delimiter)]
+				if !seenPrefixes[cp] {
+					seenPrefixes[cp] = true
+					commonPrefixes = append(commonPrefixes, CommonPrefix{Prefix: cp})
+					totalCount++
+					lastKey = obj.Key
+				}
+			} else {
+				filteredObjects = append(filteredObjects, obj)
+				totalCount++
+				lastKey = obj.Key
+			}
+		}
+
+		if isTruncated && lastKey != "" {
+			nextToken = base64.StdEncoding.EncodeToString([]byte(lastKey))
+		}
+		objects = filteredObjects
+	} else {
+		// No delimiter: simple maxKeys truncation
+		if maxKeys == 0 {
+			objects = nil
+		} else if len(objects) > maxKeys {
+			isTruncated = true
+			nextToken = base64.StdEncoding.EncodeToString([]byte(objects[maxKeys-1].Key))
+			objects = objects[:maxKeys]
+		}
 	}
 
 	// Build XML response
-	keyCount := len(objects)
+	keyCount := len(objects) + len(commonPrefixes)
 	response := ListBucketResult{
 		Xmlns:                 "http://s3.amazonaws.com/doc/2006-03-01/",
 		Name:                  bucket,
 		Prefix:                prefix,
+		Delimiter:             delimiter,
 		MaxKeys:               maxKeys,
 		IsTruncated:           isTruncated,
 		KeyCount:              keyCount,
-		Contents:              make([]Object, keyCount),
+		Contents:              make([]Object, len(objects)),
+		CommonPrefixes:        commonPrefixes,
 		NextContinuationToken: nextToken,
 		StartAfter:            startAfter,
 		ContinuationToken:     continuationToken,
@@ -207,9 +262,7 @@ func (h *S3Handler) handleListObjectsV2(w http.ResponseWriter, r *http.Request, 
 		}
 	}
 
-	w.Header().Set("Content-Type", "application/xml")
-	w.WriteHeader(http.StatusOK)
-	xml.NewEncoder(w).Encode(response)
+	h.writeXML(w, http.StatusOK, response)
 }
 
 // Object handlers
@@ -219,7 +272,8 @@ func (h *S3Handler) handlePutObject(w http.ResponseWriter, r *http.Request, buck
 		return
 	}
 
-	metadata, err := h.storage.PutObject(bucket, key, r.Body)
+	contentType := r.Header.Get("Content-Type")
+	metadata, err := h.storage.PutObject(bucket, key, r.Body, contentType)
 	if err != nil {
 		h.writeError(w, "InternalError", err.Error(), http.StatusInternalServerError)
 		return
@@ -237,19 +291,23 @@ func (h *S3Handler) handleGetObject(w http.ResponseWriter, r *http.Request, buck
 	}
 	defer reader.Close()
 
-	// Set ETag header before ServeContent
+	// Set headers before ServeContent
 	if metadata.ETag != "" {
 		w.Header().Set("ETag", metadata.ETag)
 	}
+	ct := metadata.ContentType
+	if ct == "" {
+		ct = "application/octet-stream"
+	}
+	w.Header().Set("Content-Type", ct)
 
 	// Use http.ServeContent for automatic Range request support
 	if rs, ok := reader.(io.ReadSeeker); ok {
-		http.ServeContent(w, r, key, metadata.LastModified, rs)
+		http.ServeContent(w, r, "", metadata.LastModified, rs)
 		return
 	}
 
 	// Fallback for non-seekable readers
-	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", strconv.FormatInt(metadata.Size, 10))
 	w.Header().Set("Last-Modified", metadata.LastModified.Format(http.TimeFormat))
 	w.WriteHeader(http.StatusOK)
@@ -263,7 +321,11 @@ func (h *S3Handler) handleHeadObject(w http.ResponseWriter, r *http.Request, buc
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/octet-stream")
+	ct := metadata.ContentType
+	if ct == "" {
+		ct = "application/octet-stream"
+	}
+	w.Header().Set("Content-Type", ct)
 	w.Header().Set("Content-Length", strconv.FormatInt(metadata.Size, 10))
 	w.Header().Set("Last-Modified", metadata.LastModified.Format(http.TimeFormat))
 	w.Header().Set("ETag", metadata.ETag)
@@ -306,9 +368,15 @@ func (h *S3Handler) writeError(w http.ResponseWriter, code, message string, stat
 		Message: message,
 	}
 
+	h.writeXML(w, status, errorResponse)
+}
+
+// writeXML writes an XML response with the standard XML declaration.
+func (h *S3Handler) writeXML(w http.ResponseWriter, status int, v interface{}) {
 	w.Header().Set("Content-Type", "application/xml")
 	w.WriteHeader(status)
-	xml.NewEncoder(w).Encode(errorResponse)
+	w.Write([]byte(xml.Header))
+	xml.NewEncoder(w).Encode(v)
 }
 
 func isValidBucketName(name string) bool {
@@ -331,17 +399,23 @@ func isValidBucketName(name string) bool {
 
 // XML response structures
 type ListBucketResult struct {
-	XMLName               xml.Name `xml:"ListBucketResult"`
-	Xmlns                 string   `xml:"xmlns,attr"`
-	Name                  string   `xml:"Name"`
-	Prefix                string   `xml:"Prefix"`
-	MaxKeys               int      `xml:"MaxKeys"`
-	IsTruncated           bool     `xml:"IsTruncated"`
-	KeyCount              int      `xml:"KeyCount"`
-	Contents              []Object `xml:"Contents"`
-	NextContinuationToken string   `xml:"NextContinuationToken,omitempty"`
-	StartAfter            string   `xml:"StartAfter,omitempty"`
-	ContinuationToken     string   `xml:"ContinuationToken,omitempty"`
+	XMLName               xml.Name       `xml:"ListBucketResult"`
+	Xmlns                 string         `xml:"xmlns,attr"`
+	Name                  string         `xml:"Name"`
+	Prefix                string         `xml:"Prefix"`
+	Delimiter             string         `xml:"Delimiter,omitempty"`
+	MaxKeys               int            `xml:"MaxKeys"`
+	IsTruncated           bool           `xml:"IsTruncated"`
+	KeyCount              int            `xml:"KeyCount"`
+	Contents              []Object       `xml:"Contents"`
+	CommonPrefixes        []CommonPrefix `xml:"CommonPrefixes,omitempty"`
+	NextContinuationToken string         `xml:"NextContinuationToken,omitempty"`
+	StartAfter            string         `xml:"StartAfter,omitempty"`
+	ContinuationToken     string         `xml:"ContinuationToken,omitempty"`
+}
+
+type CommonPrefix struct {
+	Prefix string `xml:"Prefix"`
 }
 
 type Object struct {

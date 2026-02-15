@@ -12,6 +12,18 @@ import (
 	"time"
 )
 
+// Storage defines the interface for bucket/object operations.
+type Storage interface {
+	BucketExists(bucket string) bool
+	CreateBucket(bucket string) error
+	DeleteBucket(bucket string) error
+	ListObjects(bucket, prefix string, maxKeys int) ([]ObjectInfo, error)
+	PutObject(bucket, key string, reader io.Reader, contentType string) (*ObjectMetadata, error)
+	GetObject(bucket, key string) (io.ReadCloser, *ObjectMetadata, error)
+	HeadObject(bucket, key string) (*ObjectMetadata, error)
+	DeleteObject(bucket, key string) error
+}
+
 type FilesystemStorage struct {
 	dataDir string
 }
@@ -20,6 +32,7 @@ type ObjectMetadata struct {
 	Size         int64     `json:"size"`
 	LastModified time.Time `json:"lastModified"`
 	ETag         string    `json:"etag"`
+	ContentType  string    `json:"contentType,omitempty"`
 }
 
 type ObjectInfo struct {
@@ -200,7 +213,7 @@ func (fs *FilesystemStorage) ListObjects(bucket, prefix string, maxKeys int) ([]
 }
 
 // Object operations
-func (fs *FilesystemStorage) PutObject(bucket, key string, reader io.Reader) (*ObjectMetadata, error) {
+func (fs *FilesystemStorage) PutObject(bucket, key string, reader io.Reader, contentType string) (*ObjectMetadata, error) {
 	if err := fs.validateObjectPath(bucket, key); err != nil {
 		return nil, err
 	}
@@ -250,10 +263,14 @@ func (fs *FilesystemStorage) PutObject(bucket, key string, reader io.Reader) (*O
 
 	// Create metadata
 	etag := fmt.Sprintf("\"%s\"", hex.EncodeToString(hash.Sum(nil)))
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
 	metadata := &ObjectMetadata{
 		Size:         size,
 		LastModified: time.Now().UTC(),
 		ETag:         etag,
+		ContentType:  contentType,
 	}
 
 	// Save metadata
@@ -377,7 +394,24 @@ func (fs *FilesystemStorage) saveMetadata(bucket, key string, metadata *ObjectMe
 		return err
 	}
 
-	return os.WriteFile(path, data, 0644)
+	// Atomic write via temp file + rename
+	dir := filepath.Dir(path)
+	tmpFile, err := os.CreateTemp(dir, ".metadata-tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmpFile.Name()
+
+	if _, err := tmpFile.Write(data); err != nil {
+		tmpFile.Close()
+		os.Remove(tmpPath)
+		return err
+	}
+	if err := tmpFile.Close(); err != nil {
+		os.Remove(tmpPath)
+		return err
+	}
+	return os.Rename(tmpPath, path)
 }
 
 func (fs *FilesystemStorage) loadMetadata(bucket, key string) (*ObjectMetadata, error) {

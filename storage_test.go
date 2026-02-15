@@ -28,7 +28,7 @@ func TestFilesystemStorage(t *testing.T) {
 		content := []byte("Hello, S3!")
 		reader := bytes.NewReader(content)
 
-		metadata, err := storage.PutObject("testbucket", "test.txt", reader)
+		metadata, err := storage.PutObject("testbucket", "test.txt", reader, "text/plain")
 		if err != nil {
 			t.Fatalf("PutObject failed: %v", err)
 		}
@@ -77,9 +77,9 @@ func TestFilesystemStorage(t *testing.T) {
 
 	t.Run("ListObjects", func(t *testing.T) {
 		// Add more objects
-		storage.PutObject("testbucket", "dir1/file1.txt", bytes.NewReader([]byte("file1")))
-		storage.PutObject("testbucket", "dir1/file2.txt", bytes.NewReader([]byte("file2")))
-		storage.PutObject("testbucket", "dir2/file3.txt", bytes.NewReader([]byte("file3")))
+		storage.PutObject("testbucket", "dir1/file1.txt", bytes.NewReader([]byte("file1")), "")
+		storage.PutObject("testbucket", "dir1/file2.txt", bytes.NewReader([]byte("file2")), "")
+		storage.PutObject("testbucket", "dir2/file3.txt", bytes.NewReader([]byte("file3")), "")
 
 		objects, err := storage.ListObjects("testbucket", "", 100)
 		if err != nil {
@@ -163,7 +163,7 @@ func TestMetadataPersistence(t *testing.T) {
 
 	// Put object
 	content := []byte("test content")
-	metadata1, err := storage.PutObject("testbucket", "test.txt", bytes.NewReader(content))
+	metadata1, err := storage.PutObject("testbucket", "test.txt", bytes.NewReader(content), "text/plain")
 	if err != nil {
 		t.Fatalf("PutObject failed: %v", err)
 	}
@@ -191,9 +191,9 @@ func TestMetadataPersistence(t *testing.T) {
 
 func TestAuthenticatorNoOp(t *testing.T) {
 	auth := &NoOpAuthenticator{}
-	// Should always return nil
-	if err := auth.Authenticate(nil); err != nil {
-		t.Errorf("NoOpAuthenticator should return nil, got: %v", err)
+	// Should return error for nil request
+	if err := auth.Authenticate(nil); err == nil {
+		t.Error("NoOpAuthenticator should return error for nil request")
 	}
 }
 
@@ -207,7 +207,7 @@ func BenchmarkPutObject(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		key := filepath.Join("test", string(rune(i%26+97)), "file.txt")
-		storage.PutObject("benchmark", key, bytes.NewReader(content))
+		storage.PutObject("benchmark", key, bytes.NewReader(content), "")
 	}
 }
 
@@ -217,7 +217,7 @@ func BenchmarkGetObject(b *testing.B) {
 	storage.CreateBucket("benchmark")
 
 	content := bytes.Repeat([]byte("a"), 1024) // 1KB
-	storage.PutObject("benchmark", "test.txt", bytes.NewReader(content))
+	storage.PutObject("benchmark", "test.txt", bytes.NewReader(content), "")
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {

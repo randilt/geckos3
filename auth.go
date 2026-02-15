@@ -33,6 +33,9 @@ func NewSigV4Authenticator(accessKey, secretKey string) *SigV4Authenticator {
 }
 
 func (a *NoOpAuthenticator) Authenticate(r *http.Request) error {
+	if r == nil {
+		return fmt.Errorf("nil request")
+	}
 	return nil
 }
 
@@ -68,7 +71,7 @@ func (a *SigV4Authenticator) authenticatePresigned(r *http.Request) error {
 	// Parse credential
 	credParts := strings.Split(credential, "/")
 	if len(credParts) < 5 || credParts[0] != a.accessKey {
-		return fmt.Errorf("invalid credentials")
+		return fmt.Errorf("the AWS Access Key Id you provided does not exist in our records")
 	}
 
 	dateStamp := credParts[1]
@@ -78,17 +81,17 @@ func (a *SigV4Authenticator) authenticatePresigned(r *http.Request) error {
 	// Validate request timestamp
 	reqTime, err := time.Parse("20060102T150405Z", date)
 	if err != nil {
-		return fmt.Errorf("invalid date format")
+		return fmt.Errorf("the date in the credential scope does not match the date in the request")
 	}
 
 	// Check expiration using actual X-Amz-Expires value
 	if expires != "" {
 		expiresSec, err := strconv.Atoi(expires)
 		if err != nil || expiresSec < 0 {
-			return fmt.Errorf("invalid expires value")
+			return fmt.Errorf("request has expired")
 		}
 		if time.Now().After(reqTime.Add(time.Duration(expiresSec) * time.Second)) {
-			return fmt.Errorf("request expired")
+			return fmt.Errorf("request has expired")
 		}
 	}
 
@@ -98,7 +101,7 @@ func (a *SigV4Authenticator) authenticatePresigned(r *http.Request) error {
 	expectedSignature := a.calculateSignature(a.secretKey, dateStamp, region, service, stringToSign)
 
 	if subtle.ConstantTimeCompare([]byte(signature), []byte(expectedSignature)) != 1 {
-		return fmt.Errorf("signature mismatch")
+		return fmt.Errorf("the request signature we calculated does not match the signature you provided")
 	}
 
 	return nil
@@ -129,7 +132,7 @@ func (a *SigV4Authenticator) authenticateHeader(r *http.Request, authHeader stri
 	// Parse credential
 	credParts := strings.Split(credential, "/")
 	if len(credParts) < 5 || credParts[0] != a.accessKey {
-		return fmt.Errorf("invalid credentials")
+		return fmt.Errorf("the AWS Access Key Id you provided does not exist in our records")
 	}
 
 	dateStamp := credParts[1]
@@ -150,7 +153,7 @@ func (a *SigV4Authenticator) authenticateHeader(r *http.Request, authHeader stri
 				skew = -skew
 			}
 			if skew > 15*time.Minute {
-				return fmt.Errorf("request timestamp too skewed")
+				return fmt.Errorf("the difference between the request time and the current time is too large")
 			}
 		}
 	}
@@ -161,7 +164,7 @@ func (a *SigV4Authenticator) authenticateHeader(r *http.Request, authHeader stri
 	expectedSignature := a.calculateSignature(a.secretKey, dateStamp, region, service, stringToSign)
 
 	if subtle.ConstantTimeCompare([]byte(signature), []byte(expectedSignature)) != 1 {
-		return fmt.Errorf("signature mismatch")
+		return fmt.Errorf("the request signature we calculated does not match the signature you provided")
 	}
 
 	return nil
@@ -171,15 +174,12 @@ func (a *SigV4Authenticator) buildCanonicalRequest(r *http.Request, signedHeader
 	// HTTPMethod + '\n' + CanonicalURI + '\n' + CanonicalQueryString + '\n' + CanonicalHeaders + '\n' + SignedHeaders + '\n' + HashedPayload
 
 	method := r.Method
-	uri := r.URL.Path
-	if uri == "" {
-		uri = "/"
-	}
+	uri := canonicalURI(r.URL.Path)
 
 	// Canonical query string
 	queryString := a.buildCanonicalQueryString(r.URL.Query(), false)
 
-	// Canonical headers
+	// Canonical headers (collapse sequential whitespace per SigV4 spec)
 	headers := strings.Split(signedHeaders, ";")
 	var canonicalHeaders strings.Builder
 	for _, h := range headers {
@@ -189,7 +189,7 @@ func (a *SigV4Authenticator) buildCanonicalRequest(r *http.Request, signedHeader
 		}
 		canonicalHeaders.WriteString(strings.ToLower(h))
 		canonicalHeaders.WriteString(":")
-		canonicalHeaders.WriteString(strings.TrimSpace(value))
+		canonicalHeaders.WriteString(canonicalHeaderValue(value))
 		canonicalHeaders.WriteString("\n")
 	}
 
@@ -205,15 +205,12 @@ func (a *SigV4Authenticator) buildCanonicalRequest(r *http.Request, signedHeader
 
 func (a *SigV4Authenticator) buildCanonicalRequestPresigned(r *http.Request, signedHeaders string) string {
 	method := r.Method
-	uri := r.URL.Path
-	if uri == "" {
-		uri = "/"
-	}
+	uri := canonicalURI(r.URL.Path)
 
 	// Canonical query string (exclude signature)
 	queryString := a.buildCanonicalQueryString(r.URL.Query(), true)
 
-	// Canonical headers
+	// Canonical headers (collapse sequential whitespace per SigV4 spec)
 	headers := strings.Split(signedHeaders, ";")
 	var canonicalHeaders strings.Builder
 	for _, h := range headers {
@@ -223,7 +220,7 @@ func (a *SigV4Authenticator) buildCanonicalRequestPresigned(r *http.Request, sig
 		}
 		canonicalHeaders.WriteString(strings.ToLower(h))
 		canonicalHeaders.WriteString(":")
-		canonicalHeaders.WriteString(strings.TrimSpace(value))
+		canonicalHeaders.WriteString(canonicalHeaderValue(value))
 		canonicalHeaders.WriteString("\n")
 	}
 
@@ -288,4 +285,21 @@ func sha256Hash(data string) string {
 func uriEncode(s string) string {
 	encoded := url.QueryEscape(s)
 	return strings.ReplaceAll(encoded, "+", "%20")
+}
+
+// canonicalURI normalizes a URI path by URI-encoding each path segment.
+func canonicalURI(path string) string {
+	if path == "" || path == "/" {
+		return "/"
+	}
+	segments := strings.Split(path, "/")
+	for i, seg := range segments {
+		segments[i] = uriEncode(seg)
+	}
+	return strings.Join(segments, "/")
+}
+
+// canonicalHeaderValue trims and collapses sequential whitespace in a header value.
+func canonicalHeaderValue(v string) string {
+	return strings.Join(strings.Fields(v), " ")
 }
