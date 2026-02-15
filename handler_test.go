@@ -2687,3 +2687,126 @@ func TestHTTPPutObjectNonChunkedUnaffected(t *testing.T) {
 		t.Errorf("want %q, got %q", original, body)
 	}
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Metadata Disabled HTTP Tests
+// ═══════════════════════════════════════════════════════════════════════════════
+
+func setupTestServerNoMetadata(t *testing.T) (*httptest.Server, *FilesystemStorage) {
+	t.Helper()
+	dir := t.TempDir()
+	storage := NewFilesystemStorage(dir)
+	storage.SetMetadataEnabled(false)
+	handler := NewS3Handler(storage, &NoOpAuthenticator{})
+	server := httptest.NewServer(handler)
+	t.Cleanup(func() { server.Close() })
+	return server, storage
+}
+
+func TestHTTPMetadataDisabledPutGetRoundTrip(t *testing.T) {
+	srv, _ := setupTestServerNoMetadata(t)
+	defer srv.Close()
+
+	mustDo(t, "PUT", srv.URL+"/bucket1", nil, nil)
+
+	// PUT with custom headers
+	resp := mustDo(t, "PUT", srv.URL+"/bucket1/file.txt",
+		strings.NewReader("hello"), map[string]string{
+			"Content-Type":   "text/plain",
+			"x-amz-meta-foo": "bar",
+		})
+	if resp.StatusCode != 200 {
+		t.Fatalf("PUT: expected 200, got %d", resp.StatusCode)
+	}
+
+	// GET should return the data correctly
+	getResp := mustDo(t, "GET", srv.URL+"/bucket1/file.txt", nil, nil)
+	if getResp.StatusCode != 200 {
+		t.Fatalf("GET: expected 200, got %d", getResp.StatusCode)
+	}
+	body, _ := io.ReadAll(getResp.Body)
+	if string(body) != "hello" {
+		t.Errorf("body: want hello, got %q", body)
+	}
+}
+
+func TestHTTPMetadataDisabledHeadReturnsSize(t *testing.T) {
+	srv, _ := setupTestServerNoMetadata(t)
+	defer srv.Close()
+
+	mustDo(t, "PUT", srv.URL+"/bucket1", nil, nil)
+	mustDo(t, "PUT", srv.URL+"/bucket1/file.txt",
+		strings.NewReader("12345"), nil)
+
+	headResp := mustDo(t, "HEAD", srv.URL+"/bucket1/file.txt", nil, nil)
+	if headResp.StatusCode != 200 {
+		t.Fatalf("HEAD: expected 200, got %d", headResp.StatusCode)
+	}
+	cl := headResp.Header.Get("Content-Length")
+	if cl != "5" {
+		t.Errorf("Content-Length: want 5, got %s", cl)
+	}
+}
+
+func TestHTTPMetadataEnabledPreservesCustomHeaders(t *testing.T) {
+	srv, _ := setupTestServer(t)
+	defer srv.Close()
+
+	mustDo(t, "PUT", srv.URL+"/metabucket", nil, nil)
+
+	mustDo(t, "PUT", srv.URL+"/metabucket/doc.txt",
+		strings.NewReader("content"), map[string]string{
+			"Content-Type":     "text/markdown",
+			"Content-Encoding": "gzip",
+			"Cache-Control":    "no-cache",
+			"x-amz-meta-owner": "bob",
+		})
+
+	headResp := mustDo(t, "HEAD", srv.URL+"/metabucket/doc.txt", nil, nil)
+	if headResp.Header.Get("Content-Type") != "text/markdown" {
+		t.Errorf("Content-Type: want text/markdown, got %q", headResp.Header.Get("Content-Type"))
+	}
+	if headResp.Header.Get("Content-Encoding") != "gzip" {
+		t.Errorf("Content-Encoding: want gzip, got %q", headResp.Header.Get("Content-Encoding"))
+	}
+	if headResp.Header.Get("Cache-Control") != "no-cache" {
+		t.Errorf("Cache-Control: want no-cache, got %q", headResp.Header.Get("Cache-Control"))
+	}
+	if headResp.Header.Get("x-amz-meta-owner") != "bob" {
+		t.Errorf("x-amz-meta-owner: want bob, got %q", headResp.Header.Get("x-amz-meta-owner"))
+	}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Fsync Enabled HTTP Tests
+// ═══════════════════════════════════════════════════════════════════════════════
+
+func setupTestServerFsync(t *testing.T) (*httptest.Server, *FilesystemStorage) {
+	t.Helper()
+	dir := t.TempDir()
+	storage := NewFilesystemStorage(dir)
+	storage.SetFsync(true)
+	handler := NewS3Handler(storage, &NoOpAuthenticator{})
+	server := httptest.NewServer(handler)
+	t.Cleanup(func() { server.Close() })
+	return server, storage
+}
+
+func TestHTTPFsyncEnabledPutGetRoundTrip(t *testing.T) {
+	srv, _ := setupTestServerFsync(t)
+	defer srv.Close()
+
+	mustDo(t, "PUT", srv.URL+"/bucket1", nil, nil)
+
+	resp := mustDo(t, "PUT", srv.URL+"/bucket1/durable.txt",
+		strings.NewReader("durable-content"), nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("PUT: expected 200, got %d", resp.StatusCode)
+	}
+
+	getResp := mustDo(t, "GET", srv.URL+"/bucket1/durable.txt", nil, nil)
+	body, _ := io.ReadAll(getResp.Body)
+	if string(body) != "durable-content" {
+		t.Errorf("body: want 'durable-content', got %q", body)
+	}
+}

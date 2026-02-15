@@ -65,9 +65,10 @@ type BucketInfo struct {
 // Lock striping with a fixed array of mutexes prevents concurrent write races
 // without unbounded memory growth from per-key locks.
 type FilesystemStorage struct {
-	dataDir     string
-	stripes     [lockStripes]sync.Mutex
-	enableFsync bool // When true, fsync files and directories after writes
+	dataDir        string
+	stripes        [lockStripes]sync.Mutex
+	enableFsync    bool // When true, fsync files and directories after writes
+	enableMetadata bool // When true, persist metadata to .metadata.json sidecar files
 }
 
 type ObjectMetadata struct {
@@ -105,7 +106,10 @@ type CompletedPart struct {
 }
 
 func NewFilesystemStorage(dataDir string) *FilesystemStorage {
-	return &FilesystemStorage{dataDir: dataDir}
+	return &FilesystemStorage{
+		dataDir:        dataDir,
+		enableMetadata: true,
+	}
 }
 
 // SetFsync enables or disables per-object fsync. When disabled (default),
@@ -113,6 +117,13 @@ func NewFilesystemStorage(dataDir string) *FilesystemStorage {
 // the behavior of MinIO and other high-performance object stores.
 func (fs *FilesystemStorage) SetFsync(enabled bool) {
 	fs.enableFsync = enabled
+}
+
+// SetMetadataEnabled controls whether metadata is persisted to .metadata.json files.
+// When disabled, metadata is computed on-demand from file attributes for performance.
+// Default: true (full S3 compatibility).
+func (fs *FilesystemStorage) SetMetadataEnabled(enabled bool) {
+	fs.enableMetadata = enabled
 }
 
 // stripe returns the mutex for a given key using FNV-1a hashing.
@@ -470,9 +481,11 @@ func (fs *FilesystemStorage) PutObject(bucket, key string, reader io.Reader, inp
 		CustomMetadata:     customMeta,
 	}
 
-	if err := fs.saveMetadata(bucket, key, metadata); err != nil {
-		// Non-fatal: object is saved, metadata is best-effort
-		return metadata, nil
+	if fs.enableMetadata {
+		if err := fs.saveMetadata(bucket, key, metadata); err != nil {
+			// Non-fatal: object is saved, metadata is best-effort
+			return metadata, nil
+		}
 	}
 
 	return metadata, nil
@@ -793,7 +806,9 @@ func (fs *FilesystemStorage) CompleteMultipartUpload(bucket, key, uploadID strin
 		ContentType:  contentType,
 	}
 
-	fs.saveMetadata(bucket, key, metadata)
+	if fs.enableMetadata {
+		fs.saveMetadata(bucket, key, metadata)
+	}
 	os.RemoveAll(stagingDir)
 
 	return metadata, nil

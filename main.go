@@ -21,12 +21,13 @@ var (
 )
 
 type Config struct {
-	DataDir      string
-	ListenAddr   string
-	AccessKey    string
-	SecretKey    string
-	AuthEnabled  bool
-	FsyncEnabled bool
+	DataDir         string
+	ListenAddr      string
+	AccessKey       string
+	SecretKey       string
+	AuthEnabled     bool
+	FsyncEnabled    bool
+	MetadataEnabled bool
 }
 
 func main() {
@@ -40,6 +41,7 @@ func main() {
 	flag.StringVar(&config.SecretKey, "secret-key", getEnv("GECKOS3_SECRET_KEY", "geckoadmin"), "AWS secret key")
 	flag.BoolVar(&config.AuthEnabled, "auth", parseBoolEnv("GECKOS3_AUTH_ENABLED", true), "Enable authentication")
 	flag.BoolVar(&config.FsyncEnabled, "fsync", parseBoolEnv("GECKOS3_FSYNC", false), "Fsync files and directories after writes (slower, stronger durability)")
+	flag.BoolVar(&config.MetadataEnabled, "metadata", parseBoolEnv("GECKOS3_METADATA", true), "Persist metadata in .json sidecar files (disable for performance)")
 	flag.Parse()
 
 	if showVersion {
@@ -59,6 +61,10 @@ func main() {
 	if config.FsyncEnabled {
 		storage.SetFsync(true)
 		log.Println("Fsync enabled: per-object durability mode (slower writes)")
+	}
+	if !config.MetadataEnabled {
+		storage.SetMetadataEnabled(false)
+		log.Println("WARNING: Metadata persistence disabled. Custom headers and ETags will not be preserved.")
 	}
 
 	// Initialize auth layer

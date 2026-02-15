@@ -101,13 +101,15 @@ geckos3
 
 All settings can be set via flags or environment variables:
 
-| Flag          | Env Var                | Default      | Description                         |
-| ------------- | ---------------------- | ------------ | ----------------------------------- |
-| `-data-dir`   | `GECKOS3_DATA_DIR`     | `./data`     | Root directory for bucket storage   |
-| `-listen`     | `GECKOS3_LISTEN`       | `:9000`      | HTTP listen address                 |
-| `-access-key` | `GECKOS3_ACCESS_KEY`   | `geckoadmin` | AWS access key ID                   |
-| `-secret-key` | `GECKOS3_SECRET_KEY`   | `geckoadmin` | AWS secret access key               |
-| `-auth`       | `GECKOS3_AUTH_ENABLED` | `true`       | Enable/disable SigV4 authentication |
+| Flag          | Env Var                | Default      | Description                                         |
+| ------------- | ---------------------- | ------------ | --------------------------------------------------- |
+| `-data-dir`   | `GECKOS3_DATA_DIR`     | `./data`     | Root directory for bucket storage                   |
+| `-listen`     | `GECKOS3_LISTEN`       | `:9000`      | HTTP listen address                                 |
+| `-access-key` | `GECKOS3_ACCESS_KEY`   | `geckoadmin` | AWS access key ID                                   |
+| `-secret-key` | `GECKOS3_SECRET_KEY`   | `geckoadmin` | AWS secret access key                               |
+| `-auth`       | `GECKOS3_AUTH_ENABLED` | `true`       | Enable/disable SigV4 authentication                 |
+| `-metadata`   | `GECKOS3_METADATA`     | `true`       | Persist metadata in `.json` sidecar files           |
+| `-fsync`      | `GECKOS3_FSYNC`        | `false`      | Fsync files/dirs after writes (stronger durability) |
 
 ```bash
 # Custom configuration
@@ -120,6 +122,12 @@ export GECKOS3_SECRET_KEY=mysecret
 
 # Disable auth for local development
 ./geckos3 -auth=false
+
+# High-performance mode (disable metadata and enable no-fsync)
+./geckos3 -metadata=false
+
+# Strong durability mode (fsync every write)
+./geckos3 -fsync=true
 ```
 
 ## Supported S3 Operations
@@ -268,9 +276,9 @@ Bucket names must be 3–63 characters, lowercase alphanumeric plus hyphens and 
 - Buckets are directories under the data dir
 - Objects are files within bucket directories
 - Nested keys (e.g. `dir/file.txt`) create subdirectories automatically
-- Metadata (ETag, Content-Type, custom headers, `x-amz-meta-*`) is stored in `.metadata.json` sidecar files
+- Metadata (ETag, Content-Type, custom headers, `x-amz-meta-*`) is stored in `.metadata.json` sidecar files (configurable via `-metadata`)
 - Authentication uses AWS Signature Version 4 (header and presigned URL)
-- All writes are atomic (temp file + fsync + rename)
+- All writes are atomic (temp file + rename); optional per-object fsync via `-fsync`
 - Concurrent writes are protected by lock striping (256 fixed mutexes, FNV-1a hash selection) — network I/O runs outside the lock; only directory creation and rename are serialized
 - CORS headers are included on every response; `OPTIONS` preflight requests are handled automatically for browser-based S3 clients
 - Multipart uploads are staged in a hidden `.geckos3-multipart/` directory per bucket and excluded from object listings
@@ -307,6 +315,46 @@ BenchmarkGetObject-12         196150          21639 ns/op       2252 B/op      2
 BenchmarkHTTPPutObject-12       1166        4173422 ns/op      44549 B/op     140 allocs/op
 BenchmarkHTTPGetObject-12      14998         293912 ns/op       8899 B/op     112 allocs/op
 ```
+
+### Performance Modes
+
+GeckoS3 supports configurable performance trade-offs:
+
+**Full Compatibility Mode (Default)**
+
+```bash
+./geckos3  # or ./geckos3 -metadata=true
+```
+
+- Content-Type, Content-Encoding, Content-Disposition, Cache-Control preserved
+- Custom metadata (`x-amz-meta-*`) stored and returned
+- ETags are consistent MD5 hashes
+- Best for: production, serving files via HTTP, S3 clients requiring full metadata
+
+**High-Performance Mode**
+
+```bash
+./geckos3 -metadata=false
+```
+
+- Skips writing `.metadata.json` sidecar files, reducing disk I/O
+- Content-Type defaults to `application/octet-stream` on GET/HEAD
+- Custom metadata not preserved across requests
+- ETags are pseudo-hashes (size+mtime based)
+- Best for: CI/CD pipelines, local testing, backup storage, temporary caches
+
+**Strong Durability Mode**
+
+```bash
+./geckos3 -fsync=true
+```
+
+- Calls `fsync` on every written file and parent directory
+- Guarantees data is flushed to durable storage before returning success
+- Significantly slower writes (0.5–10ms overhead per object)
+- Best for: critical data that must survive power loss
+
+These flags can be combined: `-metadata=false -fsync=false` gives maximum throughput, while `-metadata=true -fsync=true` gives maximum compatibility and durability.
 
 ## Logging
 

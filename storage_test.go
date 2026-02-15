@@ -2058,3 +2058,406 @@ func TestCopyObjectReplaceEmptyContentType(t *testing.T) {
 		t.Errorf("content type: %q, want application/octet-stream", meta.ContentType)
 	}
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Metadata Persistence Configuration
+// ═══════════════════════════════════════════════════════════════════════════════
+
+func TestMetadataEnabledByDefault(t *testing.T) {
+	s, cleanup := setupTestStorage(t)
+	defer cleanup()
+
+	// enableMetadata should default to true in NewFilesystemStorage
+	if !s.enableMetadata {
+		t.Error("enableMetadata should default to true")
+	}
+}
+
+func TestMetadataEnabledPreservesAll(t *testing.T) {
+	s, cleanup := setupTestStorage(t)
+	defer cleanup()
+	s.CreateBucket("test")
+
+	input := &PutObjectInput{
+		ContentType:        "text/plain",
+		ContentEncoding:    "gzip",
+		ContentDisposition: "attachment; filename=hello.txt",
+		CacheControl:       "max-age=3600",
+		CustomMetadata:     map[string]string{"author": "alice", "version": "1"},
+	}
+
+	_, err := s.PutObject("test", "file.txt", strings.NewReader("hello"), input)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	meta, err := s.HeadObject("test", "file.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if meta.ContentType != "text/plain" {
+		t.Errorf("ContentType: want text/plain, got %q", meta.ContentType)
+	}
+	if meta.ContentEncoding != "gzip" {
+		t.Errorf("ContentEncoding: want gzip, got %q", meta.ContentEncoding)
+	}
+	if meta.ContentDisposition != "attachment; filename=hello.txt" {
+		t.Errorf("ContentDisposition: want attachment, got %q", meta.ContentDisposition)
+	}
+	if meta.CacheControl != "max-age=3600" {
+		t.Errorf("CacheControl: want max-age=3600, got %q", meta.CacheControl)
+	}
+	if meta.CustomMetadata["author"] != "alice" {
+		t.Errorf("CustomMetadata author: want alice, got %q", meta.CustomMetadata["author"])
+	}
+	if meta.CustomMetadata["version"] != "1" {
+		t.Errorf("CustomMetadata version: want 1, got %q", meta.CustomMetadata["version"])
+	}
+	// ETag should be a proper MD5 hash (quoted hex)
+	if !strings.HasPrefix(meta.ETag, "\"") || !strings.HasSuffix(meta.ETag, "\"") {
+		t.Errorf("ETag should be quoted, got %q", meta.ETag)
+	}
+}
+
+func TestMetadataDisabledSkipsSidecar(t *testing.T) {
+	s, cleanup := setupTestStorage(t)
+	defer cleanup()
+	s.SetMetadataEnabled(false)
+	s.CreateBucket("test")
+
+	input := &PutObjectInput{
+		ContentType:    "text/plain",
+		CustomMetadata: map[string]string{"author": "alice"},
+	}
+
+	meta, err := s.PutObject("test", "file.txt", strings.NewReader("hello"), input)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// PutObject should still return the metadata it computed
+	if meta.ContentType != "text/plain" {
+		t.Errorf("returned ContentType: want text/plain, got %q", meta.ContentType)
+	}
+	if meta.Size != 5 {
+		t.Errorf("returned Size: want 5, got %d", meta.Size)
+	}
+
+	// But the .metadata.json sidecar file should NOT exist
+	metaPath := s.metadataPath("test", "file.txt")
+	if _, err := os.Stat(metaPath); !os.IsNotExist(err) {
+		t.Error("metadata sidecar should not exist when metadata is disabled")
+	}
+}
+
+func TestMetadataDisabledHeadStillWorks(t *testing.T) {
+	s, cleanup := setupTestStorage(t)
+	defer cleanup()
+	s.SetMetadataEnabled(false)
+	s.CreateBucket("test")
+
+	s.PutObject("test", "file.txt", strings.NewReader("hello"), &PutObjectInput{
+		ContentType:    "text/plain",
+		CustomMetadata: map[string]string{"author": "alice"},
+	})
+
+	// HeadObject should still return computed metadata from file attributes
+	meta, err := s.HeadObject("test", "file.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if meta.Size != 5 {
+		t.Errorf("Size: want 5, got %d", meta.Size)
+	}
+	if meta.ETag == "" {
+		t.Error("ETag should be generated (pseudo-hash)")
+	}
+	// Custom metadata and content-type won't be preserved without sidecar
+	if meta.CustomMetadata != nil && meta.CustomMetadata["author"] != "" {
+		t.Error("custom metadata should not be preserved when disabled")
+	}
+}
+
+func TestMetadataDisabledGetStillWorks(t *testing.T) {
+	s, cleanup := setupTestStorage(t)
+	defer cleanup()
+	s.SetMetadataEnabled(false)
+	s.CreateBucket("test")
+
+	s.PutObject("test", "file.txt", strings.NewReader("world"), nil)
+
+	reader, meta, err := s.GetObject("test", "file.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+
+	data, _ := io.ReadAll(reader)
+	if string(data) != "world" {
+		t.Errorf("body: want world, got %q", data)
+	}
+	if meta.Size != 5 {
+		t.Errorf("Size: want 5, got %d", meta.Size)
+	}
+}
+
+func TestMetadataDisabledCompleteMultipart(t *testing.T) {
+	s, cleanup := setupTestStorage(t)
+	defer cleanup()
+	s.SetMetadataEnabled(false)
+	s.CreateBucket("test")
+
+	uploadID, err := s.CreateMultipartUpload("test", "big.bin", "application/octet-stream")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	etag1, err := s.UploadPart("test", "big.bin", uploadID, 1, strings.NewReader("part1"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	meta, err := s.CompleteMultipartUpload("test", "big.bin", uploadID, []CompletedPart{
+		{PartNumber: 1, ETag: etag1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if meta.Size != 5 {
+		t.Errorf("Size: want 5, got %d", meta.Size)
+	}
+
+	// Sidecar should not exist
+	metaPath := s.metadataPath("test", "big.bin")
+	if _, err := os.Stat(metaPath); !os.IsNotExist(err) {
+		t.Error("metadata sidecar should not exist when metadata is disabled")
+	}
+
+	// But HeadObject should still work
+	headMeta, err := s.HeadObject("test", "big.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if headMeta.Size != 5 {
+		t.Errorf("HEAD Size: want 5, got %d", headMeta.Size)
+	}
+}
+
+func TestMetadataToggleAtRuntime(t *testing.T) {
+	s, cleanup := setupTestStorage(t)
+	defer cleanup()
+	s.CreateBucket("test")
+
+	// Write with metadata enabled
+	s.SetMetadataEnabled(true)
+	s.PutObject("test", "with-meta.txt", strings.NewReader("hello"), &PutObjectInput{
+		ContentType: "text/html",
+	})
+
+	// Write with metadata disabled
+	s.SetMetadataEnabled(false)
+	s.PutObject("test", "no-meta.txt", strings.NewReader("world"), &PutObjectInput{
+		ContentType: "text/html",
+	})
+
+	// First object should have sidecar
+	if _, err := os.Stat(s.metadataPath("test", "with-meta.txt")); err != nil {
+		t.Error("with-meta.txt should have metadata sidecar")
+	}
+
+	// Second object should NOT have sidecar
+	if _, err := os.Stat(s.metadataPath("test", "no-meta.txt")); !os.IsNotExist(err) {
+		t.Error("no-meta.txt should not have metadata sidecar")
+	}
+
+	// HeadObject on the first should return proper ContentType
+	meta1, _ := s.HeadObject("test", "with-meta.txt")
+	if meta1.ContentType != "text/html" {
+		t.Errorf("with-meta ContentType: want text/html, got %q", meta1.ContentType)
+	}
+}
+
+func TestMetadataDisabledListObjectsStillWorks(t *testing.T) {
+	s, cleanup := setupTestStorage(t)
+	defer cleanup()
+	s.SetMetadataEnabled(false)
+	s.CreateBucket("test")
+
+	s.PutObject("test", "a.txt", strings.NewReader("a"), nil)
+	s.PutObject("test", "b.txt", strings.NewReader("bb"), nil)
+
+	objects, err := s.ListObjects("test", "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(objects) != 2 {
+		t.Fatalf("want 2 objects, got %d", len(objects))
+	}
+
+	// Sizes should still be correct from os.Stat
+	for _, obj := range objects {
+		if obj.Key == "a.txt" && obj.Size != 1 {
+			t.Errorf("a.txt size: want 1, got %d", obj.Size)
+		}
+		if obj.Key == "b.txt" && obj.Size != 2 {
+			t.Errorf("b.txt size: want 2, got %d", obj.Size)
+		}
+	}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Fsync Configuration
+// ═══════════════════════════════════════════════════════════════════════════════
+
+func TestFsyncDisabledByDefault(t *testing.T) {
+	s, cleanup := setupTestStorage(t)
+	defer cleanup()
+
+	if s.enableFsync {
+		t.Error("enableFsync should default to false")
+	}
+}
+
+func TestFsyncEnabledPutObject(t *testing.T) {
+	s, cleanup := setupTestStorage(t)
+	defer cleanup()
+	s.SetFsync(true)
+	s.CreateBucket("test")
+
+	meta, err := s.PutObject("test", "file.txt", strings.NewReader("durable data"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.Size != 12 {
+		t.Errorf("Size: want 12, got %d", meta.Size)
+	}
+
+	// Verify data is correct
+	reader, _, err := s.GetObject("test", "file.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, _ := io.ReadAll(reader)
+	reader.Close()
+	if string(data) != "durable data" {
+		t.Errorf("body: want 'durable data', got %q", data)
+	}
+}
+
+func TestFsyncEnabledUploadPart(t *testing.T) {
+	s, cleanup := setupTestStorage(t)
+	defer cleanup()
+	s.SetFsync(true)
+	s.CreateBucket("test")
+
+	uploadID, err := s.CreateMultipartUpload("test", "obj.bin", "application/octet-stream")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	etag, err := s.UploadPart("test", "obj.bin", uploadID, 1, strings.NewReader("fsync-part"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if etag == "" {
+		t.Error("expected non-empty ETag")
+	}
+}
+
+func TestFsyncEnabledCompleteMultipart(t *testing.T) {
+	s, cleanup := setupTestStorage(t)
+	defer cleanup()
+	s.SetFsync(true)
+	s.CreateBucket("test")
+
+	uploadID, _ := s.CreateMultipartUpload("test", "big.bin", "application/octet-stream")
+	etag1, _ := s.UploadPart("test", "big.bin", uploadID, 1, strings.NewReader("part-a"), "")
+	etag2, _ := s.UploadPart("test", "big.bin", uploadID, 2, strings.NewReader("part-b"), "")
+
+	meta, err := s.CompleteMultipartUpload("test", "big.bin", uploadID, []CompletedPart{
+		{PartNumber: 1, ETag: etag1},
+		{PartNumber: 2, ETag: etag2},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.Size != 12 {
+		t.Errorf("Size: want 12, got %d", meta.Size)
+	}
+
+	reader, _, _ := s.GetObject("test", "big.bin")
+	data, _ := io.ReadAll(reader)
+	reader.Close()
+	if string(data) != "part-apart-b" {
+		t.Errorf("body: want 'part-apart-b', got %q", data)
+	}
+}
+
+func TestFsyncDisabledPutObject(t *testing.T) {
+	s, cleanup := setupTestStorage(t)
+	defer cleanup()
+	// Explicitly disabled (should be the default, but verify the path works)
+	s.SetFsync(false)
+	s.CreateBucket("test")
+
+	meta, err := s.PutObject("test", "file.txt", strings.NewReader("fast data"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.Size != 9 {
+		t.Errorf("Size: want 9, got %d", meta.Size)
+	}
+}
+
+func TestFsyncAndMetadataCombinations(t *testing.T) {
+	tests := []struct {
+		name        string
+		fsync       bool
+		metadata    bool
+		wantSidecar bool
+	}{
+		{"both-enabled", true, true, true},
+		{"both-disabled", false, false, false},
+		{"fsync-only", true, false, false},
+		{"metadata-only", false, true, true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s, cleanup := setupTestStorage(t)
+			defer cleanup()
+			s.SetFsync(tc.fsync)
+			s.SetMetadataEnabled(tc.metadata)
+			s.CreateBucket("test")
+
+			_, err := s.PutObject("test", "file.txt", strings.NewReader("test"), &PutObjectInput{
+				ContentType: "text/plain",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			metaPath := s.metadataPath("test", "file.txt")
+			_, statErr := os.Stat(metaPath)
+			hasSidecar := !os.IsNotExist(statErr)
+
+			if hasSidecar != tc.wantSidecar {
+				t.Errorf("sidecar exists=%v, want %v", hasSidecar, tc.wantSidecar)
+			}
+
+			// Data should always be readable regardless of config
+			reader, _, err := s.GetObject("test", "file.txt")
+			if err != nil {
+				t.Fatal(err)
+			}
+			data, _ := io.ReadAll(reader)
+			reader.Close()
+			if string(data) != "test" {
+				t.Errorf("body: want 'test', got %q", data)
+			}
+		})
+	}
+}

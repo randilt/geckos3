@@ -11,6 +11,9 @@ geckos3
 
 # Data directory
 data/
+benchmark-results/
+bench-data/
+warp-*.zst
 
 # Go workspace
 go.work
