@@ -1,9 +1,11 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/xml"
 	"io"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -84,6 +86,11 @@ func (h *S3Handler) handleObjectOperation(w http.ResponseWriter, r *http.Request
 
 // Bucket handlers
 func (h *S3Handler) handleCreateBucket(w http.ResponseWriter, r *http.Request, bucket string) {
+	if !isValidBucketName(bucket) {
+		h.writeError(w, "InvalidBucketName", "The specified bucket is not valid", http.StatusBadRequest)
+		return
+	}
+
 	if err := h.storage.CreateBucket(bucket); err != nil {
 		h.writeError(w, "InternalError", err.Error(), http.StatusInternalServerError)
 		return
@@ -124,28 +131,70 @@ func (h *S3Handler) handleListObjectsV2(w http.ResponseWriter, r *http.Request, 
 
 	// Parse query parameters
 	prefix := r.URL.Query().Get("prefix")
+	startAfter := r.URL.Query().Get("start-after")
+	continuationToken := r.URL.Query().Get("continuation-token")
 	maxKeys := 1000
 	if mk := r.URL.Query().Get("max-keys"); mk != "" {
-		if parsed, err := strconv.Atoi(mk); err == nil && parsed > 0 {
+		if parsed, err := strconv.Atoi(mk); err == nil && parsed >= 0 {
 			maxKeys = parsed
 		}
 	}
+	if maxKeys > 10000 {
+		maxKeys = 10000
+	}
 
-	objects, err := h.storage.ListObjects(bucket, prefix, maxKeys)
+	// Decode continuation token (base64-encoded last key)
+	startKey := startAfter
+	if continuationToken != "" {
+		if decoded, err := base64.StdEncoding.DecodeString(continuationToken); err == nil {
+			startKey = string(decoded)
+		}
+	}
+
+	// Get all matching objects for correct pagination
+	objects, err := h.storage.ListObjects(bucket, prefix, 0)
 	if err != nil {
 		h.writeError(w, "InternalError", err.Error(), http.StatusInternalServerError)
 		return
 	}
 
+	// Sort by key (S3 returns lexicographically sorted results)
+	sort.Slice(objects, func(i, j int) bool {
+		return objects[i].Key < objects[j].Key
+	})
+
+	// Apply start-after or continuation-token
+	if startKey != "" {
+		idx := sort.Search(len(objects), func(i int) bool {
+			return objects[i].Key > startKey
+		})
+		objects = objects[idx:]
+	}
+
+	// Apply maxKeys limit and determine truncation
+	isTruncated := false
+	var nextToken string
+	if maxKeys == 0 {
+		objects = nil
+	} else if len(objects) > maxKeys {
+		isTruncated = true
+		nextToken = base64.StdEncoding.EncodeToString([]byte(objects[maxKeys-1].Key))
+		objects = objects[:maxKeys]
+	}
+
 	// Build XML response
+	keyCount := len(objects)
 	response := ListBucketResult{
-		Xmlns:          "http://s3.amazonaws.com/doc/2006-03-01/",
-		Name:           bucket,
-		Prefix:         prefix,
-		MaxKeys:        maxKeys,
-		IsTruncated:    false,
-		KeyCount:       len(objects),
-		Contents:       make([]Object, len(objects)),
+		Xmlns:                 "http://s3.amazonaws.com/doc/2006-03-01/",
+		Name:                  bucket,
+		Prefix:                prefix,
+		MaxKeys:               maxKeys,
+		IsTruncated:           isTruncated,
+		KeyCount:              keyCount,
+		Contents:              make([]Object, keyCount),
+		NextContinuationToken: nextToken,
+		StartAfter:            startAfter,
+		ContinuationToken:     continuationToken,
 	}
 
 	for i, obj := range objects {
@@ -160,7 +209,6 @@ func (h *S3Handler) handleListObjectsV2(w http.ResponseWriter, r *http.Request, 
 
 	w.Header().Set("Content-Type", "application/xml")
 	w.WriteHeader(http.StatusOK)
-	
 	xml.NewEncoder(w).Encode(response)
 }
 
@@ -189,12 +237,21 @@ func (h *S3Handler) handleGetObject(w http.ResponseWriter, r *http.Request, buck
 	}
 	defer reader.Close()
 
+	// Set ETag header before ServeContent
+	if metadata.ETag != "" {
+		w.Header().Set("ETag", metadata.ETag)
+	}
+
+	// Use http.ServeContent for automatic Range request support
+	if rs, ok := reader.(io.ReadSeeker); ok {
+		http.ServeContent(w, r, key, metadata.LastModified, rs)
+		return
+	}
+
+	// Fallback for non-seekable readers
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", strconv.FormatInt(metadata.Size, 10))
 	w.Header().Set("Last-Modified", metadata.LastModified.Format(http.TimeFormat))
-	w.Header().Set("ETag", metadata.ETag)
-	w.Header().Set("Accept-Ranges", "bytes")
-
 	w.WriteHeader(http.StatusOK)
 	io.Copy(w, reader)
 }
@@ -228,14 +285,14 @@ func (h *S3Handler) handleDeleteObject(w http.ResponseWriter, r *http.Request, b
 func (h *S3Handler) parsePath(path string) (bucket, key string) {
 	// Remove leading slash
 	path = strings.TrimPrefix(path, "/")
-	
+
 	if path == "" {
 		return "", ""
 	}
 
 	parts := strings.SplitN(path, "/", 2)
 	bucket = parts[0]
-	
+
 	if len(parts) > 1 {
 		key = parts[1]
 	}
@@ -254,16 +311,37 @@ func (h *S3Handler) writeError(w http.ResponseWriter, code, message string, stat
 	xml.NewEncoder(w).Encode(errorResponse)
 }
 
+func isValidBucketName(name string) bool {
+	if len(name) < 3 || len(name) > 63 {
+		return false
+	}
+	for _, c := range name {
+		if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '.') {
+			return false
+		}
+	}
+	if name[0] == '-' || name[0] == '.' || name[len(name)-1] == '-' || name[len(name)-1] == '.' {
+		return false
+	}
+	if strings.Contains(name, "..") {
+		return false
+	}
+	return true
+}
+
 // XML response structures
 type ListBucketResult struct {
-	XMLName     xml.Name `xml:"ListBucketResult"`
-	Xmlns       string   `xml:"xmlns,attr"`
-	Name        string   `xml:"Name"`
-	Prefix      string   `xml:"Prefix"`
-	MaxKeys     int      `xml:"MaxKeys"`
-	IsTruncated bool     `xml:"IsTruncated"`
-	KeyCount    int      `xml:"KeyCount"`
-	Contents    []Object `xml:"Contents"`
+	XMLName               xml.Name `xml:"ListBucketResult"`
+	Xmlns                 string   `xml:"xmlns,attr"`
+	Name                  string   `xml:"Name"`
+	Prefix                string   `xml:"Prefix"`
+	MaxKeys               int      `xml:"MaxKeys"`
+	IsTruncated           bool     `xml:"IsTruncated"`
+	KeyCount              int      `xml:"KeyCount"`
+	Contents              []Object `xml:"Contents"`
+	NextContinuationToken string   `xml:"NextContinuationToken,omitempty"`
+	StartAfter            string   `xml:"StartAfter,omitempty"`
+	ContinuationToken     string   `xml:"ContinuationToken,omitempty"`
 }
 
 type Object struct {
@@ -279,4 +357,3 @@ type ErrorResponse struct {
 	Code    string   `xml:"Code"`
 	Message string   `xml:"Message"`
 }
-

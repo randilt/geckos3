@@ -33,37 +33,105 @@ func NewFilesystemStorage(dataDir string) *FilesystemStorage {
 	return &FilesystemStorage{dataDir: dataDir}
 }
 
+// Path validation to prevent directory traversal
+func (fs *FilesystemStorage) validateBucketPath(bucket string) error {
+	if bucket == "" {
+		return fmt.Errorf("invalid bucket name")
+	}
+	resolved := filepath.Join(fs.dataDir, bucket)
+	absData, err := filepath.Abs(fs.dataDir)
+	if err != nil {
+		return err
+	}
+	absResolved, err := filepath.Abs(resolved)
+	if err != nil {
+		return err
+	}
+	if !strings.HasPrefix(absResolved, absData+string(filepath.Separator)) {
+		return fmt.Errorf("invalid bucket name")
+	}
+	return nil
+}
+
+func (fs *FilesystemStorage) validateObjectPath(bucket, key string) error {
+	if err := fs.validateBucketPath(bucket); err != nil {
+		return err
+	}
+	if key == "" || strings.Contains(key, "\x00") {
+		return fmt.Errorf("invalid key")
+	}
+	resolved := filepath.Join(fs.dataDir, bucket, filepath.FromSlash(key))
+	absBucket, err := filepath.Abs(filepath.Join(fs.dataDir, bucket))
+	if err != nil {
+		return err
+	}
+	absResolved, err := filepath.Abs(resolved)
+	if err != nil {
+		return err
+	}
+	if !strings.HasPrefix(absResolved, absBucket+string(filepath.Separator)) {
+		return fmt.Errorf("invalid key")
+	}
+	return nil
+}
+
+// computeFileETag computes an MD5 ETag by streaming the file content.
+func (fs *FilesystemStorage) computeFileETag(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := md5.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("\"%s\"", hex.EncodeToString(h.Sum(nil))), nil
+}
+
 // Bucket operations
 func (fs *FilesystemStorage) BucketExists(bucket string) bool {
+	if err := fs.validateBucketPath(bucket); err != nil {
+		return false
+	}
 	path := filepath.Join(fs.dataDir, bucket)
 	info, err := os.Stat(path)
 	return err == nil && info.IsDir()
 }
 
 func (fs *FilesystemStorage) CreateBucket(bucket string) error {
+	if err := fs.validateBucketPath(bucket); err != nil {
+		return err
+	}
 	path := filepath.Join(fs.dataDir, bucket)
 	return os.MkdirAll(path, 0755)
 }
 
 func (fs *FilesystemStorage) DeleteBucket(bucket string) error {
+	if err := fs.validateBucketPath(bucket); err != nil {
+		return err
+	}
 	path := filepath.Join(fs.dataDir, bucket)
-	
+
 	// Check if directory is empty
 	entries, err := os.ReadDir(path)
 	if err != nil {
 		return err
 	}
-	
+
 	if len(entries) > 0 {
 		return fmt.Errorf("bucket not empty")
 	}
-	
+
 	return os.Remove(path)
 }
 
 func (fs *FilesystemStorage) ListObjects(bucket, prefix string, maxKeys int) ([]ObjectInfo, error) {
+	if err := fs.validateBucketPath(bucket); err != nil {
+		return nil, err
+	}
 	bucketPath := filepath.Join(fs.dataDir, bucket)
-	
+
 	if !fs.BucketExists(bucket) {
 		return nil, fmt.Errorf("bucket does not exist")
 	}
@@ -107,10 +175,14 @@ func (fs *FilesystemStorage) ListObjects(bucket, prefix string, maxKeys int) ([]
 		}
 
 		// Try to load metadata
-		metadata, _ := fs.loadMetadata(bucket, key)
-		etag := metadata.ETag
+		etag := ""
+		if meta, loadErr := fs.loadMetadata(bucket, key); loadErr == nil {
+			etag = meta.ETag
+		}
 		if etag == "" {
-			etag = fmt.Sprintf("\"%x\"", md5.Sum([]byte(key)))
+			if computed, hashErr := fs.computeFileETag(path); hashErr == nil {
+				etag = computed
+			}
 		}
 
 		objects = append(objects, ObjectInfo{
@@ -129,26 +201,37 @@ func (fs *FilesystemStorage) ListObjects(bucket, prefix string, maxKeys int) ([]
 
 // Object operations
 func (fs *FilesystemStorage) PutObject(bucket, key string, reader io.Reader) (*ObjectMetadata, error) {
+	if err := fs.validateObjectPath(bucket, key); err != nil {
+		return nil, err
+	}
 	objectPath := fs.objectPath(bucket, key)
-	
+
 	// Create parent directories
-	if err := os.MkdirAll(filepath.Dir(objectPath), 0755); err != nil {
+	dir := filepath.Dir(objectPath)
+	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, err
 	}
 
-	// Write to temporary file
-	tempPath := objectPath + ".tmp"
-	tempFile, err := os.Create(tempPath)
+	// Write to unique temporary file to avoid concurrent write races
+	tempFile, err := os.CreateTemp(dir, ".geckos3-tmp-*")
 	if err != nil {
 		return nil, err
 	}
+	tempPath := tempFile.Name()
 
 	// Stream data and calculate MD5
 	hash := md5.New()
 	multiWriter := io.MultiWriter(tempFile, hash)
-	
+
 	size, err := io.Copy(multiWriter, reader)
 	if err != nil {
+		tempFile.Close()
+		os.Remove(tempPath)
+		return nil, err
+	}
+
+	// Flush data to disk before rename for crash safety
+	if err := tempFile.Sync(); err != nil {
 		tempFile.Close()
 		os.Remove(tempPath)
 		return nil, err
@@ -183,8 +266,11 @@ func (fs *FilesystemStorage) PutObject(bucket, key string, reader io.Reader) (*O
 }
 
 func (fs *FilesystemStorage) GetObject(bucket, key string) (io.ReadCloser, *ObjectMetadata, error) {
+	if err := fs.validateObjectPath(bucket, key); err != nil {
+		return nil, nil, err
+	}
 	objectPath := fs.objectPath(bucket, key)
-	
+
 	file, err := os.Open(objectPath)
 	if err != nil {
 		return nil, nil, err
@@ -199,11 +285,15 @@ func (fs *FilesystemStorage) GetObject(bucket, key string) (io.ReadCloser, *Obje
 	// Try to load metadata
 	metadata, err := fs.loadMetadata(bucket, key)
 	if err != nil {
-		// Fallback to file info
+		// Fallback: compute ETag from file content
+		etag, hashErr := fs.computeFileETag(objectPath)
+		if hashErr != nil {
+			etag = ""
+		}
 		metadata = &ObjectMetadata{
 			Size:         info.Size(),
 			LastModified: info.ModTime(),
-			ETag:         fmt.Sprintf("\"%x\"", md5.Sum([]byte(key))),
+			ETag:         etag,
 		}
 	}
 
@@ -211,8 +301,11 @@ func (fs *FilesystemStorage) GetObject(bucket, key string) (io.ReadCloser, *Obje
 }
 
 func (fs *FilesystemStorage) HeadObject(bucket, key string) (*ObjectMetadata, error) {
+	if err := fs.validateObjectPath(bucket, key); err != nil {
+		return nil, err
+	}
 	objectPath := fs.objectPath(bucket, key)
-	
+
 	info, err := os.Stat(objectPath)
 	if err != nil {
 		return nil, err
@@ -221,11 +314,15 @@ func (fs *FilesystemStorage) HeadObject(bucket, key string) (*ObjectMetadata, er
 	// Try to load metadata
 	metadata, err := fs.loadMetadata(bucket, key)
 	if err != nil {
-		// Fallback to file info
+		// Fallback: compute ETag from file content
+		etag, hashErr := fs.computeFileETag(objectPath)
+		if hashErr != nil {
+			etag = ""
+		}
 		metadata = &ObjectMetadata{
 			Size:         info.Size(),
 			LastModified: info.ModTime(),
-			ETag:         fmt.Sprintf("\"%x\"", md5.Sum([]byte(key))),
+			ETag:         etag,
 		}
 	}
 
@@ -233,9 +330,12 @@ func (fs *FilesystemStorage) HeadObject(bucket, key string) (*ObjectMetadata, er
 }
 
 func (fs *FilesystemStorage) DeleteObject(bucket, key string) error {
+	if err := fs.validateObjectPath(bucket, key); err != nil {
+		return err
+	}
 	objectPath := fs.objectPath(bucket, key)
 	metadataPath := fs.metadataPath(bucket, key)
-	
+
 	// Remove object file
 	if err := os.Remove(objectPath); err != nil && !os.IsNotExist(err) {
 		return err
@@ -271,7 +371,7 @@ func (fs *FilesystemStorage) metadataPath(bucket, key string) string {
 
 func (fs *FilesystemStorage) saveMetadata(bucket, key string, metadata *ObjectMetadata) error {
 	path := fs.metadataPath(bucket, key)
-	
+
 	data, err := json.Marshal(metadata)
 	if err != nil {
 		return err
@@ -282,7 +382,7 @@ func (fs *FilesystemStorage) saveMetadata(bucket, key string, metadata *ObjectMe
 
 func (fs *FilesystemStorage) loadMetadata(bucket, key string) (*ObjectMetadata, error) {
 	path := fs.metadataPath(bucket, key)
-	
+
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err

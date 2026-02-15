@@ -3,11 +3,13 @@ package main
 import (
 	"crypto/hmac"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"fmt"
 	"net/http"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -51,7 +53,7 @@ func (a *SigV4Authenticator) Authenticate(r *http.Request) error {
 
 func (a *SigV4Authenticator) authenticatePresigned(r *http.Request) error {
 	query := r.URL.Query()
-	
+
 	algorithm := query.Get("X-Amz-Algorithm")
 	credential := query.Get("X-Amz-Credential")
 	signedHeaders := query.Get("X-Amz-SignedHeaders")
@@ -73,13 +75,19 @@ func (a *SigV4Authenticator) authenticatePresigned(r *http.Request) error {
 	region := credParts[2]
 	service := credParts[3]
 
-	// Check expiration
+	// Validate request timestamp
+	reqTime, err := time.Parse("20060102T150405Z", date)
+	if err != nil {
+		return fmt.Errorf("invalid date format")
+	}
+
+	// Check expiration using actual X-Amz-Expires value
 	if expires != "" {
-		reqTime, err := time.Parse("20060102T150405Z", date)
-		if err != nil {
-			return fmt.Errorf("invalid date format")
+		expiresSec, err := strconv.Atoi(expires)
+		if err != nil || expiresSec < 0 {
+			return fmt.Errorf("invalid expires value")
 		}
-		if time.Since(reqTime) > time.Hour*24 {
+		if time.Now().After(reqTime.Add(time.Duration(expiresSec) * time.Second)) {
 			return fmt.Errorf("request expired")
 		}
 	}
@@ -89,7 +97,7 @@ func (a *SigV4Authenticator) authenticatePresigned(r *http.Request) error {
 	stringToSign := a.buildStringToSign(date, dateStamp, region, service, canonicalRequest)
 	expectedSignature := a.calculateSignature(a.secretKey, dateStamp, region, service, stringToSign)
 
-	if signature != expectedSignature {
+	if subtle.ConstantTimeCompare([]byte(signature), []byte(expectedSignature)) != 1 {
 		return fmt.Errorf("signature mismatch")
 	}
 
@@ -99,14 +107,14 @@ func (a *SigV4Authenticator) authenticatePresigned(r *http.Request) error {
 func (a *SigV4Authenticator) authenticateHeader(r *http.Request, authHeader string) error {
 	// Parse Authorization header
 	// Format: AWS4-HMAC-SHA256 Credential=ACCESS/DATE/REGION/SERVICE/aws4_request, SignedHeaders=..., Signature=...
-	
+
 	if !strings.HasPrefix(authHeader, "AWS4-HMAC-SHA256 ") {
 		return fmt.Errorf("unsupported authorization scheme")
 	}
 
 	parts := strings.Split(authHeader[17:], ", ")
 	authMap := make(map[string]string)
-	
+
 	for _, part := range parts {
 		kv := strings.SplitN(part, "=", 2)
 		if len(kv) == 2 {
@@ -134,12 +142,25 @@ func (a *SigV4Authenticator) authenticateHeader(r *http.Request, authHeader stri
 		date = r.Header.Get("Date")
 	}
 
+	// Validate request timestamp (allow ±15 minutes clock skew)
+	if date != "" {
+		if reqTime, err := time.Parse("20060102T150405Z", date); err == nil {
+			skew := time.Since(reqTime)
+			if skew < 0 {
+				skew = -skew
+			}
+			if skew > 15*time.Minute {
+				return fmt.Errorf("request timestamp too skewed")
+			}
+		}
+	}
+
 	// Calculate expected signature
 	canonicalRequest := a.buildCanonicalRequest(r, signedHeaders)
 	stringToSign := a.buildStringToSign(date, dateStamp, region, service, canonicalRequest)
 	expectedSignature := a.calculateSignature(a.secretKey, dateStamp, region, service, stringToSign)
 
-	if signature != expectedSignature {
+	if subtle.ConstantTimeCompare([]byte(signature), []byte(expectedSignature)) != 1 {
 		return fmt.Errorf("signature mismatch")
 	}
 

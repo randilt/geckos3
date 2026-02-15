@@ -2,7 +2,9 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"os"
 	"time"
 )
 
@@ -47,7 +49,7 @@ func LoggingMiddleware(next http.Handler) http.Handler {
 
 		// Log request
 		duration := time.Since(start).Milliseconds()
-		
+
 		entry := LogEntry{
 			Timestamp: start.UTC().Format(time.RFC3339),
 			Method:    r.Method,
@@ -59,6 +61,6 @@ func LoggingMiddleware(next http.Handler) http.Handler {
 
 		// Write JSON log line to stdout
 		data, _ := json.Marshal(entry)
-		println(string(data))
+		fmt.Fprintln(os.Stdout, string(data))
 	})
 }
