@@ -2,6 +2,7 @@
 
 # Build configuration
 BINARY_NAME=geckos3
+DOCKER_REPO=randiltharusha/geckos3
 VERSION?=1.0.0
 BUILD_FLAGS=-ldflags="-s -w -X main.Version=$(VERSION)"
 
@@ -53,13 +54,19 @@ run-dev:
 # Docker commands
 docker-build:
 	@echo "Building Docker image..."
-	docker build -t $(BINARY_NAME):$(VERSION) .
-	docker tag $(BINARY_NAME):$(VERSION) $(BINARY_NAME):latest
-	@echo "✓ Docker image built"
+	docker build -t $(DOCKER_REPO):$(VERSION) .
+	docker tag $(DOCKER_REPO):$(VERSION) $(DOCKER_REPO):latest
+	@echo "✓ Docker image built: $(DOCKER_REPO):$(VERSION)"
+
+docker-push: docker-build
+	@echo "Pushing Docker images..."
+	docker push $(DOCKER_REPO):$(VERSION)
+	docker push $(DOCKER_REPO):latest
+	@echo "✓ Docker images pushed to Docker Hub"
 
 docker-run:
 	@echo "Running Docker container..."
-	docker run -d -p 9000:9000 -v $(PWD)/data:/data --name $(BINARY_NAME) $(BINARY_NAME):latest
+	docker run -d -p 9000:9000 -v $(PWD)/data:/data --name $(BINARY_NAME) $(DOCKER_REPO):latest
 	@echo "✓ Container started"
 
 docker-stop:
@@ -104,6 +111,7 @@ help:
 	@echo "  make run-dev        - Run in development mode (no auth)"
 	@echo "  make clean          - Clean build artifacts"
 	@echo "  make docker-build   - Build Docker image"
+	@echo "  make docker-push    - Build and push to Docker Hub"
 	@echo "  make docker-run     - Run Docker container"
 	@echo "  make docker-stop    - Stop Docker container"
 	@echo "  make install        - Install to /usr/local/bin"

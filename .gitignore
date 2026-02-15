@@ -28,3 +28,6 @@ go.work.sum
 Thumbs.db
 # Added by goreleaser init:
 dist/
+
+#Env
+.env

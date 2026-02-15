@@ -6,6 +6,19 @@ A lightweight S3-compatible object storage server that maps buckets to directori
 
 ## Quick Start
 
+### Using Docker (Recommended)
+
+```bash
+# Pull and run from Docker Hub
+docker run -d -p 9000:9000 \
+  -e GECKOS3_ACCESS_KEY=mykey \
+  -e GECKOS3_SECRET_KEY=mysecret \
+  -v ./data:/data \
+  randiltharusha/geckos3:latest
+```
+
+### Build from Source
+
 ```bash
 # Build and run
 make run
@@ -106,19 +119,48 @@ print(obj["Body"].read().decode())
 
 ## Docker
 
-```bash
-# Build and run with docker-compose
-docker compose up -d
+### Pull from Docker Hub
 
-# Or manually
-docker build -t geckos3 .
-docker run -d -p 9000:9000 -v ./data:/data \
+```bash
+# Latest version
+docker pull randiltharusha/geckos3:latest
+
+# Specific version
+docker pull randiltharusha/geckos3:v0.1.0
+```
+
+### Run Container
+
+```bash
+# With custom credentials (recommended)
+docker run -d -p 9000:9000 \
   -e GECKOS3_ACCESS_KEY=mykey \
   -e GECKOS3_SECRET_KEY=mysecret \
-  geckos3
+  -v ./data:/data \
+  --name geckos3 \
+  randiltharusha/geckos3:latest
+
+# With auth disabled (development only)
+docker run -d -p 9000:9000 \
+  -e GECKOS3_AUTH_ENABLED=false \
+  -v ./data:/data \
+  --name geckos3 \
+  randiltharusha/geckos3:latest
+```
+
+### Docker Compose
+
+```bash
+docker compose up -d
 ```
 
 For production, set credentials via environment variables or a `.env` file rather than leaving the defaults in `docker-compose.yml`.
+
+### Build Your Own Image
+
+```bash
+make docker-build
+```
 
 ## Health Check
 

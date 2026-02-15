@@ -50,6 +50,19 @@ archives:
       - README.md
       - LICENSE*
 
+dockers:
+  - image_templates:
+      - "randiltharusha/geckos3:{{ .Version }}"
+      - "randiltharusha/geckos3:latest"
+    dockerfile: Dockerfile
+    build_flag_templates:
+      - "--pull"
+      - "--label=org.opencontainers.image.created={{.Date}}"
+      - "--label=org.opencontainers.image.title={{.ProjectName}}"
+      - "--label=org.opencontainers.image.revision={{.FullCommit}}"
+      - "--label=org.opencontainers.image.version={{.Version}}"
+      - "--label=org.opencontainers.image.source={{.GitURL}}"
+
 checksum:
   name_template: "checksums.txt"
 
@@ -94,14 +107,17 @@ release:
 
     ### Installation
 
-    Download the archive for your platform, extract it, and run:
+    **Docker (Recommended):**
     ```bash
-    ./geckos3
+    docker pull randiltharusha/geckos3:{{ .Tag }}
+    # or
+    docker pull randiltharusha/geckos3:latest
     ```
 
-    Or use Docker:
+    **Binary:**
+    Download the archive for your platform below, extract it, and run:
     ```bash
-    docker pull ghcr.io/randilt/geckos3:{{ .Tag }}
+    ./geckos3
     ```
   footer: |
     **Full Changelog**: https://github.com/randilt/geckos3/compare/{{ .PreviousTag }}...{{ .Tag }}
