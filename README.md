@@ -42,18 +42,26 @@ export GECKOS3_SECRET_KEY=mysecret
 
 ## Supported S3 Operations
 
-| Operation     | Method   | Path                    |
-| ------------- | -------- | ----------------------- |
-| CreateBucket  | `PUT`    | `/{bucket}`             |
-| DeleteBucket  | `DELETE` | `/{bucket}`             |
-| HeadBucket    | `HEAD`   | `/{bucket}`             |
-| ListObjectsV2 | `GET`    | `/{bucket}?list-type=2` |
-| PutObject     | `PUT`    | `/{bucket}/{key}`       |
-| GetObject     | `GET`    | `/{bucket}/{key}`       |
-| HeadObject    | `HEAD`   | `/{bucket}/{key}`       |
-| DeleteObject  | `DELETE` | `/{bucket}/{key}`       |
+| Operation     | Method   | Path                                           |
+| ------------- | -------- | ---------------------------------------------- |
+| ListBuckets   | `GET`    | `/`                                            |
+| CreateBucket  | `PUT`    | `/{bucket}`                                    |
+| DeleteBucket  | `DELETE` | `/{bucket}`                                    |
+| HeadBucket    | `HEAD`   | `/{bucket}`                                    |
+| ListObjectsV1 | `GET`    | `/{bucket}`                                    |
+| ListObjectsV2 | `GET`    | `/{bucket}?list-type=2`                        |
+| PutObject     | `PUT`    | `/{bucket}/{key}`                              |
+| GetObject     | `GET`    | `/{bucket}/{key}`                              |
+| HeadObject    | `HEAD`   | `/{bucket}/{key}`                              |
+| DeleteObject  | `DELETE` | `/{bucket}/{key}`                              |
+| CopyObject    | `PUT`    | `/{bucket}/{key}` + `x-amz-copy-source` header |
+| DeleteObjects | `POST`   | `/{bucket}?delete`                             |
+
+**ListObjectsV1** supports `prefix`, `delimiter`, `max-keys`, and `marker` parameters.
 
 **ListObjectsV2** supports `prefix`, `delimiter`, `max-keys`, `start-after`, and `continuation-token` parameters. When `delimiter` is set, common prefixes are grouped and returned.
+
+**CopyObject** is triggered by setting the `x-amz-copy-source` header (value: `/{source-bucket}/{source-key}`) on a PUT request. Content-Type is preserved from the source.
 
 **GetObject** supports HTTP `Range` requests for partial content retrieval.
 
@@ -164,8 +172,7 @@ make lint            Run go vet
 
 ## Limitations
 
-- No ListBuckets or ListObjectsV1
-- No multipart upload, CopyObject, or DeleteObjects (batch)
+- No multipart upload
 - No versioning, lifecycle policies, or ACLs
 - No TLS — use a reverse proxy (nginx, Caddy) for HTTPS
 - No rate limiting — use a reverse proxy for rate limiting

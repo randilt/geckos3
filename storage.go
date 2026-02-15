@@ -17,11 +17,18 @@ type Storage interface {
 	BucketExists(bucket string) bool
 	CreateBucket(bucket string) error
 	DeleteBucket(bucket string) error
+	ListBuckets() ([]BucketInfo, error)
 	ListObjects(bucket, prefix string, maxKeys int) ([]ObjectInfo, error)
 	PutObject(bucket, key string, reader io.Reader, contentType string) (*ObjectMetadata, error)
 	GetObject(bucket, key string) (io.ReadCloser, *ObjectMetadata, error)
 	HeadObject(bucket, key string) (*ObjectMetadata, error)
 	DeleteObject(bucket, key string) error
+	CopyObject(srcBucket, srcKey, dstBucket, dstKey string) (*ObjectMetadata, error)
+}
+
+type BucketInfo struct {
+	Name         string
+	CreationDate time.Time
 }
 
 type FilesystemStorage struct {
@@ -137,6 +144,29 @@ func (fs *FilesystemStorage) DeleteBucket(bucket string) error {
 	}
 
 	return os.Remove(path)
+}
+
+func (fs *FilesystemStorage) ListBuckets() ([]BucketInfo, error) {
+	entries, err := os.ReadDir(fs.dataDir)
+	if err != nil {
+		return nil, err
+	}
+
+	var buckets []BucketInfo
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		buckets = append(buckets, BucketInfo{
+			Name:         entry.Name(),
+			CreationDate: info.ModTime(),
+		})
+	}
+	return buckets, nil
 }
 
 func (fs *FilesystemStorage) ListObjects(bucket, prefix string, maxKeys int) ([]ObjectInfo, error) {
@@ -374,6 +404,30 @@ func (fs *FilesystemStorage) DeleteObject(bucket, key string) error {
 	}
 
 	return nil
+}
+
+func (fs *FilesystemStorage) CopyObject(srcBucket, srcKey, dstBucket, dstKey string) (*ObjectMetadata, error) {
+	// Validate paths
+	if err := fs.validateObjectPath(srcBucket, srcKey); err != nil {
+		return nil, err
+	}
+	if err := fs.validateObjectPath(dstBucket, dstKey); err != nil {
+		return nil, err
+	}
+
+	// Open source
+	reader, srcMeta, err := fs.GetObject(srcBucket, srcKey)
+	if err != nil {
+		return nil, fmt.Errorf("source object not found")
+	}
+	defer reader.Close()
+
+	// Write to destination, preserving content type
+	ct := srcMeta.ContentType
+	if ct == "" {
+		ct = "application/octet-stream"
+	}
+	return fs.PutObject(dstBucket, dstKey, reader, ct)
 }
 
 // Helper functions

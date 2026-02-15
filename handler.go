@@ -42,8 +42,12 @@ func (h *S3Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Route based on method and path
 	if bucket == "" {
-		// Service operations (not implemented)
-		h.writeError(w, "NotImplemented", "Service operations not supported", http.StatusNotImplemented)
+		// Service-level operations
+		if r.Method == http.MethodGet {
+			h.handleListBuckets(w, r)
+		} else {
+			h.writeError(w, "NotImplemented", "Service operation not supported", http.StatusNotImplemented)
+		}
 		return
 	}
 
@@ -64,12 +68,18 @@ func (h *S3Handler) handleBucketOperation(w http.ResponseWriter, r *http.Request
 		h.handleDeleteBucket(w, r, bucket)
 	case http.MethodHead:
 		h.handleHeadBucket(w, r, bucket)
+	case http.MethodPost:
+		// POST /{bucket}?delete = DeleteObjects
+		if r.URL.Query().Has("delete") {
+			h.handleDeleteObjects(w, r, bucket)
+		} else {
+			h.writeError(w, "NotImplemented", "Operation not supported", http.StatusNotImplemented)
+		}
 	case http.MethodGet:
-		// Check if this is ListObjects
 		if r.URL.Query().Get("list-type") == "2" {
 			h.handleListObjectsV2(w, r, bucket)
 		} else {
-			h.writeError(w, "NotImplemented", "ListObjectsV1 not supported", http.StatusNotImplemented)
+			h.handleListObjectsV1(w, r, bucket)
 		}
 	default:
 		h.writeError(w, "MethodNotAllowed", "Method not allowed", http.StatusMethodNotAllowed)
@@ -79,7 +89,12 @@ func (h *S3Handler) handleBucketOperation(w http.ResponseWriter, r *http.Request
 func (h *S3Handler) handleObjectOperation(w http.ResponseWriter, r *http.Request, bucket, key string) {
 	switch r.Method {
 	case http.MethodPut:
-		h.handlePutObject(w, r, bucket, key)
+		// CopyObject if x-amz-copy-source is present
+		if copySource := r.Header.Get("x-amz-copy-source"); copySource != "" {
+			h.handleCopyObject(w, r, bucket, key, copySource)
+		} else {
+			h.handlePutObject(w, r, bucket, key)
+		}
 	case http.MethodGet:
 		h.handleGetObject(w, r, bucket, key)
 	case http.MethodHead:
@@ -343,6 +358,219 @@ func (h *S3Handler) handleDeleteObject(w http.ResponseWriter, r *http.Request, b
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// ListBuckets handler
+func (h *S3Handler) handleListBuckets(w http.ResponseWriter, r *http.Request) {
+	buckets, err := h.storage.ListBuckets()
+	if err != nil {
+		h.writeError(w, "InternalError", err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	xmlBuckets := make([]XMLBucket, len(buckets))
+	for i, b := range buckets {
+		xmlBuckets[i] = XMLBucket{
+			Name:         b.Name,
+			CreationDate: b.CreationDate.Format(time.RFC3339),
+		}
+	}
+
+	response := ListAllMyBucketsResult{
+		Xmlns:   "http://s3.amazonaws.com/doc/2006-03-01/",
+		Buckets: XMLBuckets{Bucket: xmlBuckets},
+	}
+
+	h.writeXML(w, http.StatusOK, response)
+}
+
+// ListObjectsV1 handler
+func (h *S3Handler) handleListObjectsV1(w http.ResponseWriter, r *http.Request, bucket string) {
+	if !h.storage.BucketExists(bucket) {
+		h.writeError(w, "NoSuchBucket", "The specified bucket does not exist", http.StatusNotFound)
+		return
+	}
+
+	prefix := r.URL.Query().Get("prefix")
+	delimiter := r.URL.Query().Get("delimiter")
+	marker := r.URL.Query().Get("marker")
+	maxKeys := 1000
+	if mk := r.URL.Query().Get("max-keys"); mk != "" {
+		if parsed, err := strconv.Atoi(mk); err == nil && parsed >= 0 {
+			maxKeys = parsed
+		}
+	}
+	if maxKeys > 10000 {
+		maxKeys = 10000
+	}
+
+	objects, err := h.storage.ListObjects(bucket, prefix, 0)
+	if err != nil {
+		h.writeError(w, "InternalError", err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	sort.Slice(objects, func(i, j int) bool {
+		return objects[i].Key < objects[j].Key
+	})
+
+	// Apply marker
+	if marker != "" {
+		idx := sort.Search(len(objects), func(i int) bool {
+			return objects[i].Key > marker
+		})
+		objects = objects[idx:]
+	}
+
+	isTruncated := false
+	var nextMarker string
+	var commonPrefixes []CommonPrefix
+
+	if delimiter != "" {
+		seenPrefixes := make(map[string]bool)
+		var filteredObjects []ObjectInfo
+		totalCount := 0
+
+		for _, obj := range objects {
+			if maxKeys > 0 && totalCount >= maxKeys {
+				isTruncated = true
+				break
+			}
+
+			rest := strings.TrimPrefix(obj.Key, prefix)
+			idx := strings.Index(rest, delimiter)
+			if idx >= 0 {
+				cp := prefix + rest[:idx+len(delimiter)]
+				if !seenPrefixes[cp] {
+					seenPrefixes[cp] = true
+					commonPrefixes = append(commonPrefixes, CommonPrefix{Prefix: cp})
+					totalCount++
+					nextMarker = obj.Key
+				}
+			} else {
+				filteredObjects = append(filteredObjects, obj)
+				totalCount++
+				nextMarker = obj.Key
+			}
+		}
+		objects = filteredObjects
+	} else {
+		if maxKeys == 0 {
+			objects = nil
+		} else if len(objects) > maxKeys {
+			isTruncated = true
+			nextMarker = objects[maxKeys-1].Key
+			objects = objects[:maxKeys]
+		}
+	}
+
+	response := ListBucketResultV1{
+		Xmlns:          "http://s3.amazonaws.com/doc/2006-03-01/",
+		Name:           bucket,
+		Prefix:         prefix,
+		Delimiter:      delimiter,
+		Marker:         marker,
+		MaxKeys:        maxKeys,
+		IsTruncated:    isTruncated,
+		Contents:       make([]Object, len(objects)),
+		CommonPrefixes: commonPrefixes,
+	}
+	if isTruncated {
+		response.NextMarker = nextMarker
+	}
+
+	for i, obj := range objects {
+		response.Contents[i] = Object{
+			Key:          obj.Key,
+			LastModified: obj.LastModified.Format(time.RFC3339),
+			ETag:         obj.ETag,
+			Size:         obj.Size,
+			StorageClass: "STANDARD",
+		}
+	}
+
+	h.writeXML(w, http.StatusOK, response)
+}
+
+// CopyObject handler
+func (h *S3Handler) handleCopyObject(w http.ResponseWriter, r *http.Request, dstBucket, dstKey, copySource string) {
+	// Parse source: /bucket/key or bucket/key
+	copySource = strings.TrimPrefix(copySource, "/")
+	parts := strings.SplitN(copySource, "/", 2)
+	if len(parts) < 2 || parts[1] == "" {
+		h.writeError(w, "InvalidArgument", "Invalid x-amz-copy-source", http.StatusBadRequest)
+		return
+	}
+	srcBucket := parts[0]
+	srcKey := parts[1]
+
+	if !h.storage.BucketExists(srcBucket) {
+		h.writeError(w, "NoSuchBucket", "The source bucket does not exist", http.StatusNotFound)
+		return
+	}
+	if !h.storage.BucketExists(dstBucket) {
+		h.writeError(w, "NoSuchBucket", "The destination bucket does not exist", http.StatusNotFound)
+		return
+	}
+
+	metadata, err := h.storage.CopyObject(srcBucket, srcKey, dstBucket, dstKey)
+	if err != nil {
+		h.writeError(w, "NoSuchKey", "The specified source key does not exist", http.StatusNotFound)
+		return
+	}
+
+	response := CopyObjectResult{
+		LastModified: metadata.LastModified.Format(time.RFC3339),
+		ETag:         metadata.ETag,
+	}
+
+	h.writeXML(w, http.StatusOK, response)
+}
+
+// DeleteObjects (batch) handler
+func (h *S3Handler) handleDeleteObjects(w http.ResponseWriter, r *http.Request, bucket string) {
+	if !h.storage.BucketExists(bucket) {
+		h.writeError(w, "NoSuchBucket", "The specified bucket does not exist", http.StatusNotFound)
+		return
+	}
+
+	// Parse request body
+	body, err := io.ReadAll(io.LimitReader(r.Body, 10*1024*1024)) // 10MB limit
+	if err != nil {
+		h.writeError(w, "InternalError", "Failed to read request body", http.StatusInternalServerError)
+		return
+	}
+
+	var deleteReq DeleteRequest
+	if err := xml.Unmarshal(body, &deleteReq); err != nil {
+		h.writeError(w, "MalformedXML", "The XML you provided was not well-formed", http.StatusBadRequest)
+		return
+	}
+
+	var deleted []DeletedObject
+	var errors []DeleteError
+
+	for _, obj := range deleteReq.Objects {
+		if err := h.storage.DeleteObject(bucket, obj.Key); err != nil {
+			errors = append(errors, DeleteError{
+				Key:     obj.Key,
+				Code:    "InternalError",
+				Message: err.Error(),
+			})
+		} else {
+			if !deleteReq.Quiet {
+				deleted = append(deleted, DeletedObject{Key: obj.Key})
+			}
+		}
+	}
+
+	response := DeleteResult{
+		Xmlns:   "http://s3.amazonaws.com/doc/2006-03-01/",
+		Deleted: deleted,
+		Errors:  errors,
+	}
+
+	h.writeXML(w, http.StatusOK, response)
+}
+
 // Helper functions
 func (h *S3Handler) parsePath(path string) (bucket, key string) {
 	// Remove leading slash
@@ -430,4 +658,70 @@ type ErrorResponse struct {
 	XMLName xml.Name `xml:"Error"`
 	Code    string   `xml:"Code"`
 	Message string   `xml:"Message"`
+}
+
+// ListBuckets XML types
+type ListAllMyBucketsResult struct {
+	XMLName xml.Name   `xml:"ListAllMyBucketsResult"`
+	Xmlns   string     `xml:"xmlns,attr"`
+	Buckets XMLBuckets `xml:"Buckets"`
+}
+
+type XMLBuckets struct {
+	Bucket []XMLBucket `xml:"Bucket"`
+}
+
+type XMLBucket struct {
+	Name         string `xml:"Name"`
+	CreationDate string `xml:"CreationDate"`
+}
+
+// ListObjectsV1 XML type
+type ListBucketResultV1 struct {
+	XMLName        xml.Name       `xml:"ListBucketResult"`
+	Xmlns          string         `xml:"xmlns,attr"`
+	Name           string         `xml:"Name"`
+	Prefix         string         `xml:"Prefix"`
+	Delimiter      string         `xml:"Delimiter,omitempty"`
+	Marker         string         `xml:"Marker"`
+	NextMarker     string         `xml:"NextMarker,omitempty"`
+	MaxKeys        int            `xml:"MaxKeys"`
+	IsTruncated    bool           `xml:"IsTruncated"`
+	Contents       []Object       `xml:"Contents"`
+	CommonPrefixes []CommonPrefix `xml:"CommonPrefixes,omitempty"`
+}
+
+// CopyObject XML type
+type CopyObjectResult struct {
+	XMLName      xml.Name `xml:"CopyObjectResult"`
+	LastModified string   `xml:"LastModified"`
+	ETag         string   `xml:"ETag"`
+}
+
+// DeleteObjects XML types
+type DeleteRequest struct {
+	XMLName xml.Name            `xml:"Delete"`
+	Quiet   bool                `xml:"Quiet"`
+	Objects []DeleteObjectEntry `xml:"Object"`
+}
+
+type DeleteObjectEntry struct {
+	Key string `xml:"Key"`
+}
+
+type DeleteResult struct {
+	XMLName xml.Name        `xml:"DeleteResult"`
+	Xmlns   string          `xml:"xmlns,attr"`
+	Deleted []DeletedObject `xml:"Deleted,omitempty"`
+	Errors  []DeleteError   `xml:"Error,omitempty"`
+}
+
+type DeletedObject struct {
+	Key string `xml:"Key"`
+}
+
+type DeleteError struct {
+	Key     string `xml:"Key"`
+	Code    string `xml:"Code"`
+	Message string `xml:"Message"`
 }
