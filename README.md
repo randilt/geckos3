@@ -8,7 +8,7 @@
 
 A lightweight S3-compatible object storage server that maps buckets to directories and objects to files on the local filesystem. Single binary, zero dependencies, pure Go.
 
-**Key features:** Multipart uploads, custom metadata (`x-amz-meta-*`), standard HTTP headers (`Content-Encoding`, `Content-Disposition`, `Cache-Control`), SHA-256 payload verification, SigV4 authentication (header + presigned URL), atomic writes, range requests, and structured JSON logging.
+**Key features:** Multipart uploads, custom metadata (`x-amz-meta-*`), standard HTTP headers (`Content-Encoding`, `Content-Disposition`, `Cache-Control`), SHA-256 payload verification, CORS support, SigV4 authentication (header + presigned URL), atomic writes, range requests, and structured JSON logging.
 
 ![geckos3](https://github.com/user-attachments/assets/59e3b56b-607e-4ffc-a1d5-2ad0c063214d)
 
@@ -34,8 +34,8 @@ Download the latest release for your platform from [GitHub Releases](https://git
 **Linux (x86_64):**
 
 ```bash
-wget https://github.com/randilt/geckos3/releases/download/v0.2.0/geckos3_0.2.0_Linux_x86_64.tar.gz
-tar -xzf geckos3_0.2.0_Linux_x86_64.tar.gz
+wget https://github.com/randilt/geckos3/releases/download/v0.3.0/geckos3_0.3.0_Linux_x86_64.tar.gz
+tar -xzf geckos3_0.3.0_Linux_x86_64.tar.gz
 chmod +x geckos3
 ./geckos3
 ```
@@ -43,8 +43,8 @@ chmod +x geckos3
 **macOS (Apple Silicon):**
 
 ```bash
-wget https://github.com/randilt/geckos3/releases/download/v0.2.0/geckos3_0.2.0_Darwin_arm64.tar.gz
-tar -xzf geckos3_0.2.0_Darwin_arm64.tar.gz
+wget https://github.com/randilt/geckos3/releases/download/v0.3.0/geckos3_0.3.0_Darwin_arm64.tar.gz
+tar -xzf geckos3_0.3.0_Darwin_arm64.tar.gz
 chmod +x geckos3
 ./geckos3
 ```
@@ -52,8 +52,8 @@ chmod +x geckos3
 **macOS (Intel):**
 
 ```bash
-wget https://github.com/randilt/geckos3/releases/download/v0.2.0/geckos3_0.2.0_Darwin_x86_64.tar.gz
-tar -xzf geckos3_0.2.0_Darwin_x86_64.tar.gz
+wget https://github.com/randilt/geckos3/releases/download/v0.3.0/geckos3_0.3.0_Darwin_x86_64.tar.gz
+tar -xzf geckos3_0.3.0_Darwin_x86_64.tar.gz
 chmod +x geckos3
 ./geckos3
 ```
@@ -61,7 +61,7 @@ chmod +x geckos3
 **Windows (PowerShell):**
 
 ```powershell
-Invoke-WebRequest -Uri "https://github.com/randilt/geckos3/releases/download/v0.2.0/geckos3_0.2.0_Windows_x86_64.tar.gz" -OutFile "geckos3.tar.gz"
+Invoke-WebRequest -Uri "https://github.com/randilt/geckos3/releases/download/v0.3.0/geckos3_0.3.0_Windows_x86_64.tar.gz" -OutFile "geckos3.tar.gz"
 tar -xzf geckos3.tar.gz
 .\geckos3.exe
 ```
@@ -219,7 +219,7 @@ s3.upload_file("large-file.bin", "mybucket", "large-file.bin")
 docker pull randiltharusha/geckos3:latest
 
 # Specific version
-docker pull randiltharusha/geckos3:v0.2.0
+docker pull randiltharusha/geckos3:v0.3.0
 ```
 
 ### Run Container
@@ -271,7 +271,8 @@ Bucket names must be 3–63 characters, lowercase alphanumeric plus hyphens and 
 - Metadata (ETag, Content-Type, custom headers, `x-amz-meta-*`) is stored in `.metadata.json` sidecar files
 - Authentication uses AWS Signature Version 4 (header and presigned URL)
 - All writes are atomic (temp file + fsync + rename)
-- Concurrent writes are protected by lock striping (256 fixed mutexes, FNV-1a hash selection) — no per-key memory growth
+- Concurrent writes are protected by lock striping (256 fixed mutexes, FNV-1a hash selection) — network I/O runs outside the lock; only directory creation and rename are serialized
+- CORS headers are included on every response; `OPTIONS` preflight requests are handled automatically for browser-based S3 clients
 - Multipart uploads are staged in a hidden `.geckos3-multipart/` directory per bucket and excluded from object listings
 - ListObjects is bounded to 100,000 scanned objects to prevent OOM on very large buckets
 - Path traversal is blocked — keys that escape the data directory are rejected
