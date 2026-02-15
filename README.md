@@ -1,4 +1,4 @@
-# geckos3
+# 🦎 GeckoS3
 
 [![GitHub Release](https://img.shields.io/github/v/release/randilt/geckos3)](https://github.com/randilt/geckos3/releases)
 [![Docker Pulls](https://img.shields.io/docker/pulls/randiltharusha/geckos3)](https://hub.docker.com/r/randiltharusha/geckos3)
