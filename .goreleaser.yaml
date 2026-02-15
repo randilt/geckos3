@@ -72,6 +72,7 @@ snapshot:
 changelog:
   sort: asc
   use: github
+  format: "{{.Message}}"
   filters:
     exclude:
       - "^docs:"
