@@ -2,6 +2,8 @@
 
 A lightweight S3-compatible object storage server that maps buckets to directories and objects to files on the local filesystem. Single binary, zero dependencies, pure Go.
 
+> **Note:** geckos3 is designed for **local development**, **testing**, **CI pipelines**, and **self-hosted single-node setups** where you need an S3-compatible API without the overhead of a full object storage system. It is **not** intended for production workloads that require replication, high availability, or multi-node clustering.
+
 ## Quick Start
 
 ```bash
