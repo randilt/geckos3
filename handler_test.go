@@ -2479,3 +2479,211 @@ func TestHTTPCopyObjectReplaceWithContentEncoding(t *testing.T) {
 		t.Errorf("Content-Disposition: %q", cd)
 	}
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HTTP Benchmarks
+// ═══════════════════════════════════════════════════════════════════════════════
+
+func setupBenchServer(b *testing.B) *httptest.Server {
+	b.Helper()
+	dir := b.TempDir()
+	storage := NewFilesystemStorage(dir)
+	handler := NewS3Handler(storage, &NoOpAuthenticator{})
+	server := httptest.NewServer(handler)
+	b.Cleanup(func() { server.Close() })
+
+	// Pre-create bucket
+	req, _ := http.NewRequest("PUT", server.URL+"/benchbucket", nil)
+	resp, _ := server.Client().Do(req)
+	resp.Body.Close()
+
+	return server
+}
+
+func BenchmarkHTTPPutObject(b *testing.B) {
+	srv := setupBenchServer(b)
+	payload := bytes.Repeat([]byte("a"), 1024) // 1KB payload
+	client := srv.Client()
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		key := fmt.Sprintf("file-%d.txt", i)
+		req, _ := http.NewRequest("PUT", srv.URL+"/benchbucket/"+key, bytes.NewReader(payload))
+		resp, _ := client.Do(req)
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}
+}
+
+func BenchmarkHTTPGetObject(b *testing.B) {
+	srv := setupBenchServer(b)
+
+	// Put an object to read
+	payload := bytes.Repeat([]byte("a"), 1024)
+	req, _ := http.NewRequest("PUT", srv.URL+"/benchbucket/read.txt", bytes.NewReader(payload))
+	resp, _ := srv.Client().Do(req)
+	resp.Body.Close()
+
+	client := srv.Client()
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		req, _ := http.NewRequest("GET", srv.URL+"/benchbucket/read.txt", nil)
+		resp, _ := client.Do(req)
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// AWS Chunked Encoding Tests
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// buildAWSChunkedBody encodes data as AWS chunked transfer encoding.
+// Each chunk uses a fixed dummy signature.
+func buildAWSChunkedBody(data []byte, chunkSize int) []byte {
+	var buf bytes.Buffer
+	for len(data) > 0 {
+		n := chunkSize
+		if n > len(data) {
+			n = len(data)
+		}
+		chunk := data[:n]
+		data = data[n:]
+		fmt.Fprintf(&buf, "%x;chunk-signature=abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890\r\n", len(chunk))
+		buf.Write(chunk)
+		buf.WriteString("\r\n")
+	}
+	// terminal chunk
+	buf.WriteString("0;chunk-signature=abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890\r\n\r\n")
+	return buf.Bytes()
+}
+
+func TestAWSChunkedReaderSingleChunk(t *testing.T) {
+	original := []byte("Hello, AWS Chunked!")
+	encoded := buildAWSChunkedBody(original, len(original))
+
+	reader := newAWSChunkedReader(bytes.NewReader(encoded))
+	got, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !bytes.Equal(got, original) {
+		t.Errorf("want %q, got %q", original, got)
+	}
+}
+
+func TestAWSChunkedReaderMultipleChunks(t *testing.T) {
+	original := bytes.Repeat([]byte("X"), 1000)
+	// Split into 256-byte chunks → 4 chunks (256+256+256+232)
+	encoded := buildAWSChunkedBody(original, 256)
+
+	reader := newAWSChunkedReader(bytes.NewReader(encoded))
+	got, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !bytes.Equal(got, original) {
+		t.Errorf("length want %d, got %d", len(original), len(got))
+	}
+}
+
+func TestAWSChunkedReaderLargePayload(t *testing.T) {
+	// Simulate a 1 MiB payload with 64KB chunks (like the real AWS SDK)
+	original := bytes.Repeat([]byte("A"), 1048576)
+	encoded := buildAWSChunkedBody(original, 65536)
+
+	reader := newAWSChunkedReader(bytes.NewReader(encoded))
+	got, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got) != len(original) {
+		t.Errorf("length want %d, got %d", len(original), len(got))
+	}
+	if !bytes.Equal(got, original) {
+		t.Errorf("content mismatch")
+	}
+}
+
+func TestHTTPPutObjectAWSChunkedEncoding(t *testing.T) {
+	srv, _ := setupTestServer(t)
+	defer srv.Close()
+
+	// Create bucket
+	mustDo(t, "PUT", srv.URL+"/chunkbucket", nil, nil)
+
+	// Build AWS chunked body
+	original := []byte("chunked-data-that-should-be-stored-exactly")
+	encoded := buildAWSChunkedBody(original, 20)
+
+	// PUT with AWS chunked headers
+	resp := mustDo(t, "PUT", srv.URL+"/chunkbucket/obj.txt",
+		bytes.NewReader(encoded), map[string]string{
+			"X-Amz-Content-Sha256": "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+			"Content-Encoding":     "aws-chunked",
+		})
+	if resp.StatusCode != 200 {
+		t.Fatalf("PUT expected 200, got %d", resp.StatusCode)
+	}
+
+	// GET and verify the size matches the original, not the encoded
+	getResp := mustDo(t, "GET", srv.URL+"/chunkbucket/obj.txt", nil, nil)
+	body, _ := io.ReadAll(getResp.Body)
+	if !bytes.Equal(body, original) {
+		t.Errorf("GET body: want %d bytes %q, got %d bytes %q",
+			len(original), original, len(body), body)
+	}
+}
+
+func TestHTTPPutObjectAWSChunkedSizeMatchesHEAD(t *testing.T) {
+	srv, _ := setupTestServer(t)
+	defer srv.Close()
+
+	mustDo(t, "PUT", srv.URL+"/chunkbucket", nil, nil)
+
+	original := bytes.Repeat([]byte("B"), 65536)
+	encoded := buildAWSChunkedBody(original, 8192)
+
+	resp := mustDo(t, "PUT", srv.URL+"/chunkbucket/sized.bin",
+		bytes.NewReader(encoded), map[string]string{
+			"X-Amz-Content-Sha256": "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+		})
+	if resp.StatusCode != 200 {
+		t.Fatalf("PUT expected 200, got %d", resp.StatusCode)
+	}
+
+	// HEAD should report the decoded (original) size
+	headResp := mustDo(t, "HEAD", srv.URL+"/chunkbucket/sized.bin", nil, nil)
+	cl := headResp.Header.Get("Content-Length")
+	if cl != fmt.Sprintf("%d", len(original)) {
+		t.Errorf("HEAD Content-Length: want %d, got %s", len(original), cl)
+	}
+}
+
+func TestHTTPPutObjectNonChunkedUnaffected(t *testing.T) {
+	srv, _ := setupTestServer(t)
+	defer srv.Close()
+
+	mustDo(t, "PUT", srv.URL+"/chunkbucket", nil, nil)
+
+	// Plain upload with UNSIGNED-PAYLOAD should NOT be decoded
+	original := []byte("plain-body-content")
+	resp := mustDo(t, "PUT", srv.URL+"/chunkbucket/plain.txt",
+		bytes.NewReader(original), map[string]string{
+			"X-Amz-Content-Sha256": "UNSIGNED-PAYLOAD",
+		})
+	if resp.StatusCode != 200 {
+		t.Fatalf("PUT expected 200, got %d", resp.StatusCode)
+	}
+
+	getResp := mustDo(t, "GET", srv.URL+"/chunkbucket/plain.txt", nil, nil)
+	body, _ := io.ReadAll(getResp.Body)
+	if !bytes.Equal(body, original) {
+		t.Errorf("want %q, got %q", original, body)
+	}
+}

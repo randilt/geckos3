@@ -30,8 +30,15 @@ test:
 
 # Run benchmarks
 bench:
-	@echo "Running benchmarks..."
+	@echo "Running Go benchmarks..."
 	go test -bench=. -benchmem ./...
+
+# Run End-to-End S3 Warp benchmarks
+bench-warp: build
+	@echo "Running E2E Warp benchmarks..."
+	@which warp > /dev/null 2>&1 || PATH="$$PATH:$$(go env GOPATH)/bin" which warp > /dev/null 2>&1 || \
+		{ echo "warp not found. Install: go install github.com/minio/warp@latest"; exit 1; }
+	PATH="$$PATH:$$(go env GOPATH)/bin" ./scripts/bench-warp.sh
 
 # Clean build artifacts
 clean:
@@ -106,7 +113,8 @@ help:
 	@echo "  make build          - Build the binary"
 	@echo "  make build-all      - Build for multiple platforms"
 	@echo "  make test           - Run tests"
-	@echo "  make bench          - Run benchmarks"
+	@echo "  make bench          - Run Go benchmarks"
+	@echo "  make bench-warp     - Run E2E S3 Warp benchmarks"
 	@echo "  make run            - Build and run the server"
 	@echo "  make run-dev        - Run in development mode (no auth)"
 	@echo "  make clean          - Clean build artifacts"

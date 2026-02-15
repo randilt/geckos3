@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/xml"
@@ -352,7 +354,14 @@ func (h *S3Handler) handlePutObject(w http.ResponseWriter, r *http.Request, buck
 		input.ExpectedSHA256 = expectedSHA
 	}
 
-	metadata, err := h.storage.PutObject(bucket, key, r.Body, input)
+	// If the client is using AWS chunked transfer encoding, decode the
+	// chunked framing so only raw object bytes reach the storage layer.
+	var body io.Reader = r.Body
+	if isAWSChunked(r) {
+		body = newAWSChunkedReader(r.Body)
+	}
+
+	metadata, err := h.storage.PutObject(bucket, key, body, input)
 	if err != nil {
 		if errors.Is(err, ErrBadDigest) {
 			h.writeError(w, r, "BadDigest", "The Content-SHA256 you specified did not match what we received", http.StatusBadRequest)
@@ -753,7 +762,14 @@ func (h *S3Handler) handleUploadPart(w http.ResponseWriter, r *http.Request, buc
 		expectedSHA = sha
 	}
 
-	etag, err := h.storage.UploadPart(bucket, key, uploadID, partNumber, r.Body, expectedSHA)
+	// If the client is using AWS chunked transfer encoding, decode the
+	// chunked framing so only raw object bytes reach the storage layer.
+	var body io.Reader = r.Body
+	if isAWSChunked(r) {
+		body = newAWSChunkedReader(r.Body)
+	}
+
+	etag, err := h.storage.UploadPart(bucket, key, uploadID, partNumber, body, expectedSHA)
 	if err != nil {
 		if errors.Is(err, ErrBadDigest) {
 			h.writeError(w, r, "BadDigest", "The Content-SHA256 you specified did not match what we received", http.StatusBadRequest)
@@ -1002,4 +1018,110 @@ type CompleteMultipartUploadResultXML struct {
 	Bucket  string   `xml:"Bucket"`
 	Key     string   `xml:"Key"`
 	ETag    string   `xml:"ETag"`
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// AWS Chunked Transfer Encoding Decoder
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// When an AWS SDK sends a PutObject with content-sha256 =
+// STREAMING-AWS4-HMAC-SHA256-PAYLOAD, the HTTP body is wrapped in AWS's own
+// chunked encoding (distinct from HTTP/1.1 Transfer-Encoding: chunked).
+// Each chunk is framed as:
+//
+//     <hex-size>;chunk-signature=<sig>\r\n
+//     <data>\r\n
+//
+// The final chunk has size 0.  We must strip this framing so the storage
+// layer receives only the raw object bytes.
+
+// isAWSChunked reports whether the request uses AWS chunked transfer encoding.
+func isAWSChunked(r *http.Request) bool {
+	sha := r.Header.Get("X-Amz-Content-Sha256")
+	if strings.HasPrefix(sha, "STREAMING-") {
+		return true
+	}
+	ce := r.Header.Get("Content-Encoding")
+	return strings.Contains(ce, "aws-chunked")
+}
+
+// awsChunkedReader strips AWS chunked framing from an io.Reader, yielding
+// only the raw object data.
+type awsChunkedReader struct {
+	scanner *bufio.Reader
+	chunk   io.Reader // current chunk data (limited reader)
+	done    bool
+}
+
+func newAWSChunkedReader(r io.Reader) *awsChunkedReader {
+	return &awsChunkedReader{
+		scanner: bufio.NewReaderSize(r, 64*1024),
+	}
+}
+
+func (a *awsChunkedReader) Read(p []byte) (int, error) {
+	for {
+		if a.done {
+			return 0, io.EOF
+		}
+
+		// If we have an active chunk, drain it first.
+		if a.chunk != nil {
+			n, err := a.chunk.Read(p)
+			if n > 0 {
+				return n, nil
+			}
+			if err == io.EOF {
+				// Consume the trailing \r\n after chunk data.
+				a.chunk = nil
+				var crlf [2]byte
+				if _, err2 := io.ReadFull(a.scanner, crlf[:]); err2 != nil {
+					return 0, err2
+				}
+				continue
+			}
+			return n, err
+		}
+
+		// Read the next chunk header line: <hex-size>;chunk-signature=<sig>\r\n
+		line, err := a.scanner.ReadBytes('\n')
+		if err != nil {
+			if err == io.EOF && len(line) == 0 {
+				a.done = true
+				return 0, io.EOF
+			}
+			if err == io.EOF {
+				// partial line at end — treat as done
+				a.done = true
+				return 0, io.EOF
+			}
+			return 0, err
+		}
+
+		// Trim \r\n
+		line = bytes.TrimRight(line, "\r\n")
+
+		// Extract hex size before the semicolon.
+		semiIdx := bytes.IndexByte(line, ';')
+		var hexSize []byte
+		if semiIdx >= 0 {
+			hexSize = line[:semiIdx]
+		} else {
+			hexSize = line
+		}
+
+		size, err := strconv.ParseInt(string(bytes.TrimSpace(hexSize)), 16, 64)
+		if err != nil {
+			return 0, fmt.Errorf("aws-chunked: invalid chunk size %q: %w", hexSize, err)
+		}
+
+		if size == 0 {
+			a.done = true
+			// Drain any trailing headers/CRLF (best effort).
+			io.Copy(io.Discard, a.scanner)
+			return 0, io.EOF
+		}
+
+		a.chunk = io.LimitReader(a.scanner, size)
+	}
 }

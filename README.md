@@ -279,6 +279,35 @@ Bucket names must be 3–63 characters, lowercase alphanumeric plus hyphens and 
 - Path traversal is blocked — keys that escape the data directory are rejected
 - HTTP server enforces `ReadHeaderTimeout` (10s), `ReadTimeout` / `WriteTimeout` (6h for large uploads), and `IdleTimeout` (120s)
 
+## Performance
+
+GeckoS3 has a near-zero overhead translation layer between the S3 protocol and the local filesystem. It uses pure streaming I/O and lock striping to maximize concurrency.
+
+### End-to-End S3 Throughput
+
+Benchmark your own setup using [MinIO Warp](https://github.com/minio/warp):
+
+```bash
+make bench-warp
+```
+
+### Internal Memory Efficiency
+
+Run Go-native benchmarks to verify allocations per operation:
+
+```bash
+make bench
+```
+
+Example output:
+
+```text
+BenchmarkPutObject-12           1364        6582083 ns/op       3585 B/op      51 allocs/op
+BenchmarkGetObject-12         196150          21639 ns/op       2252 B/op      29 allocs/op
+BenchmarkHTTPPutObject-12       1166        4173422 ns/op      44549 B/op     140 allocs/op
+BenchmarkHTTPGetObject-12      14998         293912 ns/op       8899 B/op     112 allocs/op
+```
+
 ## Logging
 
 Structured JSON logs are written to stdout on every request:
@@ -303,7 +332,8 @@ make build           Build the binary
 make run             Build and run
 make run-dev         Run with auth disabled
 make test            Run tests
-make bench           Run benchmarks
+make bench           Run Go benchmarks
+make bench-warp      Run E2E S3 Warp benchmarks
 make clean           Remove build artifacts and data/
 make docker-build    Build Docker image
 make docker-run      Run in Docker
