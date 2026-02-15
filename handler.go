@@ -620,7 +620,29 @@ func (h *S3Handler) handleCopyObject(w http.ResponseWriter, r *http.Request, dst
 		return
 	}
 
-	metadata, err := h.storage.CopyObject(srcBucket, srcKey, dstBucket, dstKey)
+	// Check metadata directive: REPLACE uses headers from this request.
+	var overrideMeta *PutObjectInput
+	if strings.EqualFold(r.Header.Get("x-amz-metadata-directive"), "REPLACE") {
+		overrideMeta = &PutObjectInput{
+			ContentType:        r.Header.Get("Content-Type"),
+			ContentEncoding:    r.Header.Get("Content-Encoding"),
+			ContentDisposition: r.Header.Get("Content-Disposition"),
+			CacheControl:       r.Header.Get("Cache-Control"),
+		}
+		customMeta := make(map[string]string)
+		for name, values := range r.Header {
+			lower := strings.ToLower(name)
+			if strings.HasPrefix(lower, "x-amz-meta-") && len(values) > 0 {
+				metaKey := strings.TrimPrefix(lower, "x-amz-meta-")
+				customMeta[metaKey] = values[0]
+			}
+		}
+		if len(customMeta) > 0 {
+			overrideMeta.CustomMetadata = customMeta
+		}
+	}
+
+	metadata, err := h.storage.CopyObject(srcBucket, srcKey, dstBucket, dstKey, overrideMeta)
 	if err != nil {
 		h.writeError(w, r, "NoSuchKey", "The specified source key does not exist", http.StatusNotFound)
 		return
@@ -724,8 +746,19 @@ func (h *S3Handler) handleUploadPart(w http.ResponseWriter, r *http.Request, buc
 		return
 	}
 
-	etag, err := h.storage.UploadPart(bucket, key, uploadID, partNumber, r.Body)
+	// Pass SHA256 expectation to storage layer for verification.
+	var expectedSHA string
+	sha := r.Header.Get("X-Amz-Content-Sha256")
+	if sha != "" && sha != "UNSIGNED-PAYLOAD" && !strings.HasPrefix(sha, "STREAMING-") {
+		expectedSHA = sha
+	}
+
+	etag, err := h.storage.UploadPart(bucket, key, uploadID, partNumber, r.Body, expectedSHA)
 	if err != nil {
+		if errors.Is(err, ErrBadDigest) {
+			h.writeError(w, r, "BadDigest", "The Content-SHA256 you specified did not match what we received", http.StatusBadRequest)
+			return
+		}
 		h.writeError(w, r, "NoSuchUpload", err.Error(), http.StatusNotFound)
 		return
 	}

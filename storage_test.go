@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -383,7 +384,7 @@ func TestCopyObjectSameBucket(t *testing.T) {
 	body := "copy-me"
 	s.PutObject("b", "orig.txt", strings.NewReader(body), &PutObjectInput{ContentType: "text/plain"})
 
-	meta, err := s.CopyObject("b", "orig.txt", "b", "copied.txt")
+	meta, err := s.CopyObject("b", "orig.txt", "b", "copied.txt", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -406,7 +407,7 @@ func TestCopyObjectCrossBucket(t *testing.T) {
 	s.CreateBucket("dst")
 
 	s.PutObject("src", "file.txt", strings.NewReader("cross-bucket"), &PutObjectInput{ContentType: "application/json"})
-	meta, err := s.CopyObject("src", "file.txt", "dst", "file.txt")
+	meta, err := s.CopyObject("src", "file.txt", "dst", "file.txt", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -427,7 +428,7 @@ func TestCopyObjectSourceNotFound(t *testing.T) {
 	defer cleanup()
 	s.CreateBucket("b")
 
-	_, err := s.CopyObject("b", "nope.txt", "b", "dest.txt")
+	_, err := s.CopyObject("b", "nope.txt", "b", "dest.txt", nil)
 	if err == nil {
 		t.Fatal("copy from missing source should fail")
 	}
@@ -439,7 +440,7 @@ func TestCopyObjectToNested(t *testing.T) {
 	s.CreateBucket("b")
 
 	s.PutObject("b", "flat.txt", strings.NewReader("nested-copy"), nil)
-	_, err := s.CopyObject("b", "flat.txt", "b", "deep/nested/copy.txt")
+	_, err := s.CopyObject("b", "flat.txt", "b", "deep/nested/copy.txt", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -459,7 +460,7 @@ func TestCopyObjectOverwritesExisting(t *testing.T) {
 	s.PutObject("b", "src.txt", strings.NewReader("source"), &PutObjectInput{ContentType: "text/plain"})
 	s.PutObject("b", "dst.txt", strings.NewReader("old-dest"), &PutObjectInput{ContentType: "text/html"})
 
-	_, err := s.CopyObject("b", "src.txt", "b", "dst.txt")
+	_, err := s.CopyObject("b", "src.txt", "b", "dst.txt", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -712,12 +713,12 @@ func TestPathTraversalCopyObject(t *testing.T) {
 	s.CreateBucket("b")
 	s.PutObject("b", "legit.txt", strings.NewReader("ok"), nil)
 
-	_, err := s.CopyObject("b", "legit.txt", "b", "../../escape.txt")
+	_, err := s.CopyObject("b", "legit.txt", "b", "../../escape.txt", nil)
 	if err == nil {
 		t.Fatal("should reject path traversal in CopyObject destination")
 	}
 
-	_, err = s.CopyObject("b", "../../passwd", "b", "dest.txt")
+	_, err = s.CopyObject("b", "../../passwd", "b", "dest.txt", nil)
 	if err == nil {
 		t.Fatal("should reject path traversal in CopyObject source")
 	}
@@ -1039,7 +1040,7 @@ func TestMultipartUploadBasic(t *testing.T) {
 	}
 
 	// Upload two parts
-	etag1, err := s.UploadPart("b", "multipart.txt", uploadID, 1, strings.NewReader("Hello, "))
+	etag1, err := s.UploadPart("b", "multipart.txt", uploadID, 1, strings.NewReader("Hello, "), "")
 	if err != nil {
 		t.Fatalf("UploadPart 1: %v", err)
 	}
@@ -1047,7 +1048,7 @@ func TestMultipartUploadBasic(t *testing.T) {
 		t.Fatal("part 1 etag should not be empty")
 	}
 
-	etag2, err := s.UploadPart("b", "multipart.txt", uploadID, 2, strings.NewReader("World!"))
+	etag2, err := s.UploadPart("b", "multipart.txt", uploadID, 2, strings.NewReader("World!"), "")
 	if err != nil {
 		t.Fatalf("UploadPart 2: %v", err)
 	}
@@ -1102,7 +1103,7 @@ func TestMultipartUploadInvalidUploadID(t *testing.T) {
 	defer cleanup()
 	s.CreateBucket("b")
 
-	_, err := s.UploadPart("b", "file.txt", "invalid-upload-id", 1, strings.NewReader("data"))
+	_, err := s.UploadPart("b", "file.txt", "invalid-upload-id", 1, strings.NewReader("data"), "")
 	if err == nil {
 		t.Fatal("UploadPart should fail with invalid uploadID")
 	}
@@ -1114,14 +1115,14 @@ func TestMultipartUploadAbort(t *testing.T) {
 	s.CreateBucket("b")
 
 	uploadID, _ := s.CreateMultipartUpload("b", "abort.txt", "text/plain")
-	s.UploadPart("b", "abort.txt", uploadID, 1, strings.NewReader("data"))
+	s.UploadPart("b", "abort.txt", uploadID, 1, strings.NewReader("data"), "")
 
 	if err := s.AbortMultipartUpload("b", "abort.txt", uploadID); err != nil {
 		t.Fatalf("AbortMultipartUpload: %v", err)
 	}
 
 	// After abort, the upload should no longer exist
-	_, err := s.UploadPart("b", "abort.txt", uploadID, 2, strings.NewReader("more"))
+	_, err := s.UploadPart("b", "abort.txt", uploadID, 2, strings.NewReader("more"), "")
 	if err == nil {
 		t.Fatal("UploadPart should fail after abort")
 	}
@@ -1150,7 +1151,7 @@ func TestMultipartCompleteMissingPart(t *testing.T) {
 	s.CreateBucket("b")
 
 	uploadID, _ := s.CreateMultipartUpload("b", "missing.txt", "text/plain")
-	s.UploadPart("b", "missing.txt", uploadID, 1, strings.NewReader("data"))
+	s.UploadPart("b", "missing.txt", uploadID, 1, strings.NewReader("data"), "")
 
 	// Complete with part 2 which was never uploaded
 	parts := []CompletedPart{
@@ -1180,7 +1181,7 @@ func TestMultipartUploadDefaultContentType(t *testing.T) {
 	s.CreateBucket("b")
 
 	uploadID, _ := s.CreateMultipartUpload("b", "file.bin", "")
-	etag, _ := s.UploadPart("b", "file.bin", uploadID, 1, strings.NewReader("binary"))
+	etag, _ := s.UploadPart("b", "file.bin", uploadID, 1, strings.NewReader("binary"), "")
 	meta, err := s.CompleteMultipartUpload("b", "file.bin", uploadID, []CompletedPart{
 		{PartNumber: 1, ETag: etag},
 	})
@@ -1198,7 +1199,7 @@ func TestMultipartUploadSinglePart(t *testing.T) {
 	s.CreateBucket("b")
 
 	uploadID, _ := s.CreateMultipartUpload("b", "single.txt", "text/plain")
-	etag, _ := s.UploadPart("b", "single.txt", uploadID, 1, strings.NewReader("only-one-part"))
+	etag, _ := s.UploadPart("b", "single.txt", uploadID, 1, strings.NewReader("only-one-part"), "")
 
 	meta, err := s.CompleteMultipartUpload("b", "single.txt", uploadID, []CompletedPart{
 		{PartNumber: 1, ETag: etag},
@@ -1228,7 +1229,7 @@ func TestMultipartUploadLargePartCount(t *testing.T) {
 	var parts []CompletedPart
 	for i := 1; i <= 5; i++ {
 		data := strings.Repeat(string(rune('a'+i-1)), 100)
-		etag, err := s.UploadPart("b", "many-parts.txt", uploadID, i, strings.NewReader(data))
+		etag, err := s.UploadPart("b", "many-parts.txt", uploadID, i, strings.NewReader(data), "")
 		if err != nil {
 			t.Fatalf("UploadPart %d: %v", i, err)
 		}
@@ -1254,7 +1255,7 @@ func TestMultipartUploadDoesNotAppearInListing(t *testing.T) {
 
 	// Start a multipart upload but don't complete it
 	uploadID, _ := s.CreateMultipartUpload("b", "pending.txt", "text/plain")
-	s.UploadPart("b", "pending.txt", uploadID, 1, strings.NewReader("partial"))
+	s.UploadPart("b", "pending.txt", uploadID, 1, strings.NewReader("partial"), "")
 
 	// Also put a normal object
 	s.PutObject("b", "normal.txt", strings.NewReader("ok"), nil)
@@ -1284,7 +1285,7 @@ func TestMultipartOverwritesExistingObject(t *testing.T) {
 
 	// Overwrite via multipart
 	uploadID, _ := s.CreateMultipartUpload("b", "overwrite.txt", "text/plain")
-	etag, _ := s.UploadPart("b", "overwrite.txt", uploadID, 1, strings.NewReader("replaced"))
+	etag, _ := s.UploadPart("b", "overwrite.txt", uploadID, 1, strings.NewReader("replaced"), "")
 	_, err := s.CompleteMultipartUpload("b", "overwrite.txt", uploadID, []CompletedPart{
 		{PartNumber: 1, ETag: etag},
 	})
@@ -1823,4 +1824,237 @@ func setupTestStorage(t *testing.T) (*FilesystemStorage, func()) {
 	dir := t.TempDir()
 	s := NewFilesystemStorage(dir)
 	return s, func() { os.RemoveAll(dir) }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Fix 1: UploadPart SHA256 Verification
+// ═══════════════════════════════════════════════════════════════════════════════
+
+func TestUploadPartSHA256Match(t *testing.T) {
+	s, cleanup := setupTestStorage(t)
+	defer cleanup()
+	s.CreateBucket("b")
+
+	uploadID, _ := s.CreateMultipartUpload("b", "sha.txt", "text/plain")
+
+	data := []byte("part-data-for-sha")
+	h := sha256.Sum256(data)
+	expected := hex.EncodeToString(h[:])
+
+	etag, err := s.UploadPart("b", "sha.txt", uploadID, 1, bytes.NewReader(data), expected)
+	if err != nil {
+		t.Fatalf("UploadPart with valid SHA256: %v", err)
+	}
+	if etag == "" {
+		t.Fatal("etag should not be empty")
+	}
+}
+
+func TestUploadPartSHA256Mismatch(t *testing.T) {
+	s, cleanup := setupTestStorage(t)
+	defer cleanup()
+	s.CreateBucket("b")
+
+	uploadID, _ := s.CreateMultipartUpload("b", "sha.txt", "text/plain")
+
+	data := []byte("real-data")
+	wrongHash := "0000000000000000000000000000000000000000000000000000000000000000"
+
+	_, err := s.UploadPart("b", "sha.txt", uploadID, 1, bytes.NewReader(data), wrongHash)
+	if err == nil {
+		t.Fatal("should fail with mismatched SHA256")
+	}
+	if err.Error() != ErrBadDigest.Error() {
+		t.Errorf("expected ErrBadDigest, got: %v", err)
+	}
+}
+
+func TestUploadPartSHA256EmptySkipsCheck(t *testing.T) {
+	s, cleanup := setupTestStorage(t)
+	defer cleanup()
+	s.CreateBucket("b")
+
+	uploadID, _ := s.CreateMultipartUpload("b", "sha.txt", "text/plain")
+
+	// Empty expectedSHA256 should skip verification
+	etag, err := s.UploadPart("b", "sha.txt", uploadID, 1, bytes.NewReader([]byte("data")), "")
+	if err != nil {
+		t.Fatalf("UploadPart with empty SHA256: %v", err)
+	}
+	if etag == "" {
+		t.Fatal("etag should not be empty")
+	}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Fix 2: Multipart Upload Garbage Collection
+// ═══════════════════════════════════════════════════════════════════════════════
+
+func TestCleanAbandonedUploads(t *testing.T) {
+	s, cleanup := setupTestStorage(t)
+	defer cleanup()
+	s.CreateBucket("b")
+
+	// Create a multipart upload and stage a part
+	uploadID, _ := s.CreateMultipartUpload("b", "abandoned.txt", "text/plain")
+	s.UploadPart("b", "abandoned.txt", uploadID, 1, strings.NewReader("data"), "")
+
+	stagingDir := s.multipartStagingPath("b", uploadID)
+
+	// Backdate the staging directory to 25 hours ago
+	old := time.Now().Add(-25 * time.Hour)
+	os.Chtimes(stagingDir, old, old)
+
+	// Run GC with 24h max age
+	cleanAbandonedUploads(s.dataDir, 24*time.Hour)
+
+	// Staging dir should be gone
+	if _, err := os.Stat(stagingDir); !os.IsNotExist(err) {
+		t.Fatal("abandoned staging dir should have been removed")
+	}
+}
+
+func TestCleanAbandonedUploadsKeepsRecent(t *testing.T) {
+	s, cleanup := setupTestStorage(t)
+	defer cleanup()
+	s.CreateBucket("b")
+
+	// Create a recent multipart upload
+	uploadID, _ := s.CreateMultipartUpload("b", "recent.txt", "text/plain")
+	s.UploadPart("b", "recent.txt", uploadID, 1, strings.NewReader("data"), "")
+
+	stagingDir := s.multipartStagingPath("b", uploadID)
+
+	// Run GC — this upload is fresh, should NOT be removed
+	cleanAbandonedUploads(s.dataDir, 24*time.Hour)
+
+	if _, err := os.Stat(stagingDir); os.IsNotExist(err) {
+		t.Fatal("recent staging dir should NOT have been removed")
+	}
+}
+
+func TestCleanAbandonedUploadsNoBuckets(t *testing.T) {
+	s, cleanup := setupTestStorage(t)
+	defer cleanup()
+
+	// No buckets — should not panic or error
+	cleanAbandonedUploads(s.dataDir, 24*time.Hour)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Fix 3: Directory Fsync on Rename (syncParentDir)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+func TestSyncParentDirDoesNotPanic(t *testing.T) {
+	s, cleanup := setupTestStorage(t)
+	defer cleanup()
+	s.CreateBucket("b")
+
+	// PutObject internally calls syncParentDir — just verify no panic
+	_, err := s.PutObject("b", "sync-test.txt", strings.NewReader("data"), nil)
+	if err != nil {
+		t.Fatalf("PutObject: %v", err)
+	}
+
+	// CompleteMultipartUpload also calls syncParentDir
+	uploadID, _ := s.CreateMultipartUpload("b", "sync-multi.txt", "text/plain")
+	etag, _ := s.UploadPart("b", "sync-multi.txt", uploadID, 1, strings.NewReader("data"), "")
+	_, err = s.CompleteMultipartUpload("b", "sync-multi.txt", uploadID, []CompletedPart{
+		{PartNumber: 1, ETag: etag},
+	})
+	if err != nil {
+		t.Fatalf("CompleteMultipartUpload: %v", err)
+	}
+}
+
+func TestSyncParentDirNonExistentPath(t *testing.T) {
+	// Should not panic on invalid path
+	syncParentDir("/nonexistent/path/file.txt")
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Fix 5: CopyObject Metadata Directive
+// ═══════════════════════════════════════════════════════════════════════════════
+
+func TestCopyObjectDefaultCopiesMetadata(t *testing.T) {
+	s, cleanup := setupTestStorage(t)
+	defer cleanup()
+	s.CreateBucket("b")
+
+	s.PutObject("b", "src.txt", strings.NewReader("data"), &PutObjectInput{
+		ContentType:    "text/html",
+		CacheControl:   "max-age=3600",
+		CustomMetadata: map[string]string{"author": "alice"},
+	})
+
+	// COPY directive (nil override) should preserve source metadata
+	meta, err := s.CopyObject("b", "src.txt", "b", "dst.txt", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.ContentType != "text/html" {
+		t.Errorf("content type: %q, want text/html", meta.ContentType)
+	}
+	if meta.CacheControl != "max-age=3600" {
+		t.Errorf("cache-control: %q", meta.CacheControl)
+	}
+
+	dstMeta, _ := s.HeadObject("b", "dst.txt")
+	if dstMeta.CustomMetadata["author"] != "alice" {
+		t.Errorf("custom metadata missing: %v", dstMeta.CustomMetadata)
+	}
+}
+
+func TestCopyObjectReplaceMetadata(t *testing.T) {
+	s, cleanup := setupTestStorage(t)
+	defer cleanup()
+	s.CreateBucket("b")
+
+	s.PutObject("b", "src.txt", strings.NewReader("data"), &PutObjectInput{
+		ContentType:    "text/html",
+		CacheControl:   "max-age=3600",
+		CustomMetadata: map[string]string{"author": "alice"},
+	})
+
+	// REPLACE directive — provide new metadata
+	overrideMeta := &PutObjectInput{
+		ContentType:    "application/json",
+		CacheControl:   "no-cache",
+		CustomMetadata: map[string]string{"version": "2"},
+	}
+	meta, err := s.CopyObject("b", "src.txt", "b", "dst.txt", overrideMeta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.ContentType != "application/json" {
+		t.Errorf("content type: %q, want application/json", meta.ContentType)
+	}
+	if meta.CacheControl != "no-cache" {
+		t.Errorf("cache-control: %q", meta.CacheControl)
+	}
+
+	dstMeta, _ := s.HeadObject("b", "dst.txt")
+	if dstMeta.CustomMetadata["version"] != "2" {
+		t.Errorf("custom metadata: %v", dstMeta.CustomMetadata)
+	}
+	if _, ok := dstMeta.CustomMetadata["author"]; ok {
+		t.Error("source metadata should not be present with REPLACE directive")
+	}
+}
+
+func TestCopyObjectReplaceEmptyContentType(t *testing.T) {
+	s, cleanup := setupTestStorage(t)
+	defer cleanup()
+	s.CreateBucket("b")
+
+	s.PutObject("b", "src.txt", strings.NewReader("data"), &PutObjectInput{
+		ContentType: "text/html",
+	})
+
+	// REPLACE with empty ContentType should default to application/octet-stream
+	overrideMeta := &PutObjectInput{}
+	meta, _ := s.CopyObject("b", "src.txt", "b", "dst.txt", overrideMeta)
+	if meta.ContentType != "application/octet-stream" {
+		t.Errorf("content type: %q, want application/octet-stream", meta.ContentType)
+	}
 }

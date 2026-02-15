@@ -147,7 +147,7 @@ export GECKOS3_SECRET_KEY=mysecret
 
 **ListObjectsV2** supports `prefix`, `delimiter`, `max-keys`, `start-after`, and `continuation-token` parameters. When `delimiter` is set, common prefixes are grouped and returned.
 
-**CopyObject** is triggered by setting the `x-amz-copy-source` header (value: `/{source-bucket}/{source-key}`) on a PUT request. Content-Type is preserved from the source.
+**CopyObject** is triggered by setting the `x-amz-copy-source` header (value: `/{source-bucket}/{source-key}`) on a PUT request. Content-Type is preserved from the source. The `x-amz-metadata-directive` header controls metadata handling: `COPY` (default) preserves source metadata, `REPLACE` uses the `Content-Type`, `Content-Encoding`, `Content-Disposition`, `Cache-Control`, and `x-amz-meta-*` headers from the PUT request instead.
 
 **GetObject** supports HTTP `Range` requests for partial content retrieval.
 
@@ -159,7 +159,7 @@ export GECKOS3_SECRET_KEY=mysecret
 
 **Multipart Upload** — Create an upload with `POST ?uploads`, upload parts with `PUT ?partNumber=N&uploadId=X`, complete with `POST ?uploadId=X`, or abort with `DELETE ?uploadId=X`. Parts are staged on the filesystem and concatenated on completion. The multipart ETag follows the S3 convention (`md5-N`).
 
-**Payload Verification** — When `X-Amz-Content-Sha256` is set to a hex SHA-256 digest (not `UNSIGNED-PAYLOAD`), the server verifies the payload matches and returns `400 BadDigest` on mismatch.
+**Payload Verification** — When `X-Amz-Content-Sha256` is set to a hex SHA-256 digest (not `UNSIGNED-PAYLOAD`), the server verifies the payload matches and returns `400 BadDigest` on mismatch. This applies to both `PutObject` and `UploadPart`.
 
 ## Usage with AWS CLI
 
@@ -274,6 +274,7 @@ Bucket names must be 3–63 characters, lowercase alphanumeric plus hyphens and 
 - Concurrent writes are protected by lock striping (256 fixed mutexes, FNV-1a hash selection) — network I/O runs outside the lock; only directory creation and rename are serialized
 - CORS headers are included on every response; `OPTIONS` preflight requests are handled automatically for browser-based S3 clients
 - Multipart uploads are staged in a hidden `.geckos3-multipart/` directory per bucket and excluded from object listings
+- Abandoned multipart uploads are automatically garbage-collected after 24 hours by a background goroutine
 - ListObjects is bounded to 100,000 scanned objects to prevent OOM on very large buckets
 - Path traversal is blocked — keys that escape the data directory are rejected
 - HTTP server enforces `ReadHeaderTimeout` (10s), `ReadTimeout` / `WriteTimeout` (6h for large uploads), and `IdleTimeout` (120s)

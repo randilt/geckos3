@@ -47,11 +47,11 @@ type Storage interface {
 	GetObject(bucket, key string) (io.ReadCloser, *ObjectMetadata, error)
 	HeadObject(bucket, key string) (*ObjectMetadata, error)
 	DeleteObject(bucket, key string) error
-	CopyObject(srcBucket, srcKey, dstBucket, dstKey string) (*ObjectMetadata, error)
+	CopyObject(srcBucket, srcKey, dstBucket, dstKey string, overrideMeta *PutObjectInput) (*ObjectMetadata, error)
 
 	// Multipart upload operations
 	CreateMultipartUpload(bucket, key, contentType string) (string, error)
-	UploadPart(bucket, key, uploadID string, partNumber int, reader io.Reader) (string, error)
+	UploadPart(bucket, key, uploadID string, partNumber int, reader io.Reader, expectedSHA256 string) (string, error)
 	CompleteMultipartUpload(bucket, key, uploadID string, parts []CompletedPart) (*ObjectMetadata, error)
 	AbortMultipartUpload(bucket, key, uploadID string) error
 }
@@ -428,6 +428,7 @@ func (fs *FilesystemStorage) PutObject(bucket, key string, reader io.Reader, inp
 		os.Remove(tempPath)
 		return nil, err
 	}
+	syncParentDir(objectPath)
 	mu.Unlock()
 
 	// Build metadata from input
@@ -545,7 +546,7 @@ func (fs *FilesystemStorage) DeleteObject(bucket, key string) error {
 	return nil
 }
 
-func (fs *FilesystemStorage) CopyObject(srcBucket, srcKey, dstBucket, dstKey string) (*ObjectMetadata, error) {
+func (fs *FilesystemStorage) CopyObject(srcBucket, srcKey, dstBucket, dstKey string, overrideMeta *PutObjectInput) (*ObjectMetadata, error) {
 	if err := fs.validateObjectPath(srcBucket, srcKey); err != nil {
 		return nil, err
 	}
@@ -559,7 +560,15 @@ func (fs *FilesystemStorage) CopyObject(srcBucket, srcKey, dstBucket, dstKey str
 	}
 	defer reader.Close()
 
-	// Preserve all metadata from source
+	// If overrideMeta is provided (REPLACE directive), use it instead of source metadata.
+	if overrideMeta != nil {
+		if overrideMeta.ContentType == "" {
+			overrideMeta.ContentType = "application/octet-stream"
+		}
+		return fs.PutObject(dstBucket, dstKey, reader, overrideMeta)
+	}
+
+	// Default: COPY directive — preserve all metadata from source
 	input := &PutObjectInput{
 		ContentType:        srcMeta.ContentType,
 		ContentEncoding:    srcMeta.ContentEncoding,
@@ -608,7 +617,7 @@ func (fs *FilesystemStorage) CreateMultipartUpload(bucket, key, contentType stri
 }
 
 // UploadPart saves a single part to the staging directory and returns its ETag.
-func (fs *FilesystemStorage) UploadPart(bucket, key, uploadID string, partNumber int, reader io.Reader) (string, error) {
+func (fs *FilesystemStorage) UploadPart(bucket, key, uploadID string, partNumber int, reader io.Reader, expectedSHA256 string) (string, error) {
 	stagingDir := fs.multipartStagingPath(bucket, uploadID)
 	if _, err := os.Stat(stagingDir); os.IsNotExist(err) {
 		return "", fmt.Errorf("upload ID not found")
@@ -622,8 +631,17 @@ func (fs *FilesystemStorage) UploadPart(bucket, key, uploadID string, partNumber
 	}
 	tempPath := tempFile.Name()
 
-	hash := md5.New()
-	multiWriter := io.MultiWriter(tempFile, hash)
+	md5Hash := md5.New()
+	writers := []io.Writer{tempFile, md5Hash}
+
+	var sha256Sum func() []byte
+	if expectedSHA256 != "" {
+		h := sha256.New()
+		sha256Sum = func() []byte { return h.Sum(nil) }
+		writers = append(writers, h)
+	}
+
+	multiWriter := io.MultiWriter(writers...)
 
 	if _, err := io.Copy(multiWriter, reader); err != nil {
 		tempFile.Close()
@@ -641,12 +659,21 @@ func (fs *FilesystemStorage) UploadPart(bucket, key, uploadID string, partNumber
 		return "", err
 	}
 
+	// Verify SHA256 before committing the part.
+	if sha256Sum != nil {
+		computed := hex.EncodeToString(sha256Sum())
+		if computed != expectedSHA256 {
+			os.Remove(tempPath)
+			return "", ErrBadDigest
+		}
+	}
+
 	if err := os.Rename(tempPath, partPath); err != nil {
 		os.Remove(tempPath)
 		return "", err
 	}
 
-	etag := fmt.Sprintf("\"%s\"", hex.EncodeToString(hash.Sum(nil)))
+	etag := fmt.Sprintf("\"%s\"", hex.EncodeToString(md5Hash.Sum(nil)))
 	return etag, nil
 }
 
@@ -724,6 +751,7 @@ func (fs *FilesystemStorage) CompleteMultipartUpload(bucket, key, uploadID strin
 		os.Remove(tempPath)
 		return nil, err
 	}
+	syncParentDir(objectPath)
 	mu.Unlock()
 
 	// Build S3-style multipart ETag: MD5-of-data + "-N"
@@ -826,4 +854,18 @@ func generateUploadID() string {
 	b := make([]byte, 16)
 	rand.Read(b)
 	return hex.EncodeToString(b)
+}
+
+// syncParentDir opens the parent directory of path, calls Sync to flush the
+// directory entry to durable storage, then closes it. Errors are intentionally
+// ignored because some filesystems (e.g. Windows, certain FUSE mounts) do not
+// support fsync on directories.
+func syncParentDir(path string) {
+	dir := filepath.Dir(path)
+	d, err := os.Open(dir)
+	if err != nil {
+		return
+	}
+	d.Sync()
+	d.Close()
 }

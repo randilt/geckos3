@@ -2176,3 +2176,306 @@ func TestHTTPDeleteBucketWithArtifacts(t *testing.T) {
 		t.Errorf("bucket should be gone: got %d", headResp.StatusCode)
 	}
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Fix 1: UploadPart SHA256 Verification via HTTP
+// ═══════════════════════════════════════════════════════════════════════════════
+
+func TestHTTPUploadPartSHA256Match(t *testing.T) {
+	srv, _ := setupTestServer(t)
+
+	mustDo(t, "PUT", srv.URL+"/mybucket", nil, nil).Body.Close()
+
+	// Initiate multipart
+	resp := mustDo(t, "POST", srv.URL+"/mybucket/sha.txt?uploads", nil,
+		map[string]string{"Content-Type": "text/plain"})
+	body := readBody(t, resp)
+	var initResult InitiateMultipartUploadResult
+	xml.Unmarshal([]byte(body), &initResult)
+	uploadID := initResult.UploadId
+
+	// Upload part with valid SHA256
+	data := []byte("sha256-verified-part")
+	h := sha256.Sum256(data)
+	expected := hex.EncodeToString(h[:])
+
+	partResp := mustDo(t, "PUT",
+		fmt.Sprintf("%s/mybucket/sha.txt?partNumber=1&uploadId=%s", srv.URL, uploadID),
+		bytes.NewReader(data),
+		map[string]string{"X-Amz-Content-Sha256": expected})
+	partResp.Body.Close()
+	if partResp.StatusCode != 200 {
+		t.Errorf("upload part with valid SHA256: %d", partResp.StatusCode)
+	}
+	if partResp.Header.Get("ETag") == "" {
+		t.Error("ETag should be present")
+	}
+}
+
+func TestHTTPUploadPartSHA256Mismatch(t *testing.T) {
+	srv, _ := setupTestServer(t)
+
+	mustDo(t, "PUT", srv.URL+"/mybucket", nil, nil).Body.Close()
+
+	resp := mustDo(t, "POST", srv.URL+"/mybucket/sha.txt?uploads", nil, nil)
+	body := readBody(t, resp)
+	var initResult InitiateMultipartUploadResult
+	xml.Unmarshal([]byte(body), &initResult)
+	uploadID := initResult.UploadId
+
+	// Upload part with wrong SHA256
+	partResp := mustDo(t, "PUT",
+		fmt.Sprintf("%s/mybucket/sha.txt?partNumber=1&uploadId=%s", srv.URL, uploadID),
+		strings.NewReader("real-data"),
+		map[string]string{"X-Amz-Content-Sha256": "0000000000000000000000000000000000000000000000000000000000000000"})
+	respBody := readBody(t, partResp)
+	if partResp.StatusCode != 400 {
+		t.Errorf("upload part with wrong SHA256: expected 400, got %d, body: %s", partResp.StatusCode, respBody)
+	}
+	if !strings.Contains(respBody, "BadDigest") {
+		t.Errorf("expected BadDigest error code, got: %s", respBody)
+	}
+}
+
+func TestHTTPUploadPartUnsignedPayloadSkipsSHA(t *testing.T) {
+	srv, _ := setupTestServer(t)
+
+	mustDo(t, "PUT", srv.URL+"/mybucket", nil, nil).Body.Close()
+
+	resp := mustDo(t, "POST", srv.URL+"/mybucket/sha.txt?uploads", nil, nil)
+	body := readBody(t, resp)
+	var initResult InitiateMultipartUploadResult
+	xml.Unmarshal([]byte(body), &initResult)
+	uploadID := initResult.UploadId
+
+	// UNSIGNED-PAYLOAD should skip SHA256 check
+	partResp := mustDo(t, "PUT",
+		fmt.Sprintf("%s/mybucket/sha.txt?partNumber=1&uploadId=%s", srv.URL, uploadID),
+		strings.NewReader("data"),
+		map[string]string{"X-Amz-Content-Sha256": "UNSIGNED-PAYLOAD"})
+	partResp.Body.Close()
+	if partResp.StatusCode != 200 {
+		t.Errorf("UNSIGNED-PAYLOAD should succeed: %d", partResp.StatusCode)
+	}
+}
+
+func TestHTTPUploadPartStreamingPrefixSkipsSHA(t *testing.T) {
+	srv, _ := setupTestServer(t)
+
+	mustDo(t, "PUT", srv.URL+"/mybucket", nil, nil).Body.Close()
+
+	resp := mustDo(t, "POST", srv.URL+"/mybucket/sha.txt?uploads", nil, nil)
+	body := readBody(t, resp)
+	var initResult InitiateMultipartUploadResult
+	xml.Unmarshal([]byte(body), &initResult)
+	uploadID := initResult.UploadId
+
+	// STREAMING-AWS4-HMAC-SHA256-PAYLOAD should skip SHA256 check
+	partResp := mustDo(t, "PUT",
+		fmt.Sprintf("%s/mybucket/sha.txt?partNumber=1&uploadId=%s", srv.URL, uploadID),
+		strings.NewReader("data"),
+		map[string]string{"X-Amz-Content-Sha256": "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"})
+	partResp.Body.Close()
+	if partResp.StatusCode != 200 {
+		t.Errorf("STREAMING prefix should succeed: %d", partResp.StatusCode)
+	}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Fix 4: Configuration Boolean Parsing
+// ═══════════════════════════════════════════════════════════════════════════════
+
+func TestParseBoolEnv(t *testing.T) {
+	cases := []struct {
+		envVal   string
+		expected bool
+	}{
+		{"true", true},
+		{"TRUE", true},
+		{"True", true},
+		{"1", true},
+		{"t", true},
+		{"T", true},
+		{"false", false},
+		{"FALSE", false},
+		{"False", false},
+		{"0", false},
+		{"f", false},
+		{"F", false},
+	}
+
+	key := "GECKOS3_TEST_BOOL"
+	for _, tc := range cases {
+		os.Setenv(key, tc.envVal)
+		result := parseBoolEnv(key, true)
+		if result != tc.expected {
+			t.Errorf("parseBoolEnv(%q) = %v, want %v", tc.envVal, result, tc.expected)
+		}
+		os.Unsetenv(key)
+	}
+}
+
+func TestParseBoolEnvDefaults(t *testing.T) {
+	key := "GECKOS3_TEST_BOOL_MISSING"
+	os.Unsetenv(key)
+
+	// Empty var should return default
+	if result := parseBoolEnv(key, true); !result {
+		t.Error("empty var should default to true")
+	}
+	if result := parseBoolEnv(key, false); result {
+		t.Error("empty var should default to false")
+	}
+
+	// Unparseable value should return default
+	os.Setenv(key, "maybe")
+	if result := parseBoolEnv(key, true); !result {
+		t.Error("unparseable should default to true")
+	}
+	if result := parseBoolEnv(key, false); result {
+		t.Error("unparseable should default to false")
+	}
+	os.Unsetenv(key)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Fix 5: CopyObject Metadata Directive via HTTP
+// ═══════════════════════════════════════════════════════════════════════════════
+
+func TestHTTPCopyObjectMetadataDirectiveCopy(t *testing.T) {
+	srv, _ := setupTestServer(t)
+
+	mustDo(t, "PUT", srv.URL+"/mybucket", nil, nil).Body.Close()
+	mustDo(t, "PUT", srv.URL+"/mybucket/src.txt",
+		strings.NewReader("data"), map[string]string{
+			"Content-Type":   "text/html",
+			"Cache-Control":  "max-age=3600",
+			"x-amz-meta-foo": "bar",
+		}).Body.Close()
+
+	// COPY directive (default) — should preserve source metadata
+	resp := mustDo(t, "PUT", srv.URL+"/mybucket/dst.txt", nil, map[string]string{
+		"x-amz-copy-source":        "/mybucket/src.txt",
+		"x-amz-metadata-directive": "COPY",
+	})
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("copy with COPY directive: %d", resp.StatusCode)
+	}
+
+	// Verify destination has source metadata
+	headResp := mustDo(t, "HEAD", srv.URL+"/mybucket/dst.txt", nil, nil)
+	headResp.Body.Close()
+	if ct := headResp.Header.Get("Content-Type"); ct != "text/html" {
+		t.Errorf("Content-Type: %q, want text/html", ct)
+	}
+	if cc := headResp.Header.Get("Cache-Control"); cc != "max-age=3600" {
+		t.Errorf("Cache-Control: %q", cc)
+	}
+	if meta := headResp.Header.Get("x-amz-meta-foo"); meta != "bar" {
+		t.Errorf("x-amz-meta-foo: %q", meta)
+	}
+}
+
+func TestHTTPCopyObjectMetadataDirectiveReplace(t *testing.T) {
+	srv, _ := setupTestServer(t)
+
+	mustDo(t, "PUT", srv.URL+"/mybucket", nil, nil).Body.Close()
+	mustDo(t, "PUT", srv.URL+"/mybucket/src.txt",
+		strings.NewReader("data"), map[string]string{
+			"Content-Type":   "text/html",
+			"Cache-Control":  "max-age=3600",
+			"x-amz-meta-foo": "bar",
+		}).Body.Close()
+
+	// REPLACE directive — use metadata from PUT request
+	resp := mustDo(t, "PUT", srv.URL+"/mybucket/dst.txt", nil, map[string]string{
+		"x-amz-copy-source":        "/mybucket/src.txt",
+		"x-amz-metadata-directive": "REPLACE",
+		"Content-Type":             "application/json",
+		"Cache-Control":            "no-cache",
+		"x-amz-meta-version":       "2",
+	})
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("copy with REPLACE directive: %d", resp.StatusCode)
+	}
+
+	// Verify destination has the new metadata
+	headResp := mustDo(t, "HEAD", srv.URL+"/mybucket/dst.txt", nil, nil)
+	headResp.Body.Close()
+	if ct := headResp.Header.Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type: %q, want application/json", ct)
+	}
+	if cc := headResp.Header.Get("Cache-Control"); cc != "no-cache" {
+		t.Errorf("Cache-Control: %q, want no-cache", cc)
+	}
+	if meta := headResp.Header.Get("x-amz-meta-version"); meta != "2" {
+		t.Errorf("x-amz-meta-version: %q, want 2", meta)
+	}
+	// Source-specific metadata should NOT be present
+	if meta := headResp.Header.Get("x-amz-meta-foo"); meta != "" {
+		t.Errorf("x-amz-meta-foo should not be present with REPLACE, got: %q", meta)
+	}
+}
+
+func TestHTTPCopyObjectMetadataDirectiveDefault(t *testing.T) {
+	srv, _ := setupTestServer(t)
+
+	mustDo(t, "PUT", srv.URL+"/mybucket", nil, nil).Body.Close()
+	mustDo(t, "PUT", srv.URL+"/mybucket/src.txt",
+		strings.NewReader("data"), map[string]string{
+			"Content-Type":   "text/css",
+			"x-amz-meta-key": "value",
+		}).Body.Close()
+
+	// No directive header — defaults to COPY behavior
+	resp := mustDo(t, "PUT", srv.URL+"/mybucket/dst.txt", nil, map[string]string{
+		"x-amz-copy-source": "/mybucket/src.txt",
+	})
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("copy without directive: %d", resp.StatusCode)
+	}
+
+	headResp := mustDo(t, "HEAD", srv.URL+"/mybucket/dst.txt", nil, nil)
+	headResp.Body.Close()
+	if ct := headResp.Header.Get("Content-Type"); ct != "text/css" {
+		t.Errorf("Content-Type should be preserved: %q", ct)
+	}
+	if meta := headResp.Header.Get("x-amz-meta-key"); meta != "value" {
+		t.Errorf("custom metadata should be preserved: %q", meta)
+	}
+}
+
+func TestHTTPCopyObjectReplaceWithContentEncoding(t *testing.T) {
+	srv, _ := setupTestServer(t)
+
+	mustDo(t, "PUT", srv.URL+"/mybucket", nil, nil).Body.Close()
+	mustDo(t, "PUT", srv.URL+"/mybucket/src.txt",
+		strings.NewReader("data"), map[string]string{
+			"Content-Type": "text/plain",
+		}).Body.Close()
+
+	// REPLACE with Content-Encoding and Content-Disposition
+	resp := mustDo(t, "PUT", srv.URL+"/mybucket/dst.txt", nil, map[string]string{
+		"x-amz-copy-source":        "/mybucket/src.txt",
+		"x-amz-metadata-directive": "REPLACE",
+		"Content-Type":             "application/gzip",
+		"Content-Encoding":         "gzip",
+		"Content-Disposition":      "attachment; filename=\"data.gz\"",
+	})
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("REPLACE with encoding: %d", resp.StatusCode)
+	}
+
+	headResp := mustDo(t, "HEAD", srv.URL+"/mybucket/dst.txt", nil, nil)
+	headResp.Body.Close()
+	if ce := headResp.Header.Get("Content-Encoding"); ce != "gzip" {
+		t.Errorf("Content-Encoding: %q, want gzip", ce)
+	}
+	if cd := headResp.Header.Get("Content-Disposition"); cd != "attachment; filename=\"data.gz\"" {
+		t.Errorf("Content-Disposition: %q", cd)
+	}
+}

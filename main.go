@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strconv"
 	"syscall"
 	"time"
 )
@@ -35,7 +37,7 @@ func main() {
 	flag.StringVar(&config.ListenAddr, "listen", getEnv("GECKOS3_LISTEN", ":9000"), "HTTP server address")
 	flag.StringVar(&config.AccessKey, "access-key", getEnv("GECKOS3_ACCESS_KEY", "geckoadmin"), "AWS access key")
 	flag.StringVar(&config.SecretKey, "secret-key", getEnv("GECKOS3_SECRET_KEY", "geckoadmin"), "AWS secret key")
-	flag.BoolVar(&config.AuthEnabled, "auth", getEnv("GECKOS3_AUTH_ENABLED", "true") == "true", "Enable authentication")
+	flag.BoolVar(&config.AuthEnabled, "auth", parseBoolEnv("GECKOS3_AUTH_ENABLED", true), "Enable authentication")
 	flag.Parse()
 
 	if showVersion {
@@ -70,6 +72,9 @@ func main() {
 
 	// Wrap with CORS, logging middleware and concurrency limit
 	loggedHandler := CORSMiddleware(LoggingMiddleware(MaxClientsMiddleware(1024)(handler)))
+
+	// Start background garbage collection for abandoned multipart uploads.
+	startMultipartGC(config.DataDir, 1*time.Hour, 24*time.Hour)
 
 	server := &http.Server{
 		Addr:              config.ListenAddr,
@@ -108,4 +113,56 @@ func getEnv(key, defaultValue string) string {
 		return value
 	}
 	return defaultValue
+}
+
+// parseBoolEnv reads an environment variable and parses it with strconv.ParseBool.
+// Returns defaultVal if the variable is empty or unparseable.
+func parseBoolEnv(key string, defaultVal bool) bool {
+	v := os.Getenv(key)
+	if v == "" {
+		return defaultVal
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return defaultVal
+	}
+	return b
+}
+
+// startMultipartGC launches a background goroutine that periodically removes
+// abandoned multipart upload staging directories older than maxAge.
+func startMultipartGC(dataDir string, interval, maxAge time.Duration) {
+	ticker := time.NewTicker(interval)
+	go func() {
+		for range ticker.C {
+			cleanAbandonedUploads(dataDir, maxAge)
+		}
+	}()
+}
+
+func cleanAbandonedUploads(dataDir string, maxAge time.Duration) {
+	buckets, err := os.ReadDir(dataDir)
+	if err != nil {
+		return
+	}
+	cutoff := time.Now().Add(-maxAge)
+	for _, b := range buckets {
+		if !b.IsDir() {
+			continue
+		}
+		mpDir := filepath.Join(dataDir, b.Name(), multipartStagingDir)
+		uploads, err := os.ReadDir(mpDir)
+		if err != nil {
+			continue
+		}
+		for _, u := range uploads {
+			info, err := u.Info()
+			if err != nil {
+				continue
+			}
+			if info.ModTime().Before(cutoff) {
+				os.RemoveAll(filepath.Join(mpDir, u.Name()))
+			}
+		}
+	}
 }
