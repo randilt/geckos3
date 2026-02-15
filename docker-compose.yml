@@ -6,11 +6,11 @@ services:
     volumes:
       - ./data:/data
     environment:
-      - S3LITE_DATA_DIR=/data
-      - S3LITE_LISTEN=:9000
-      - S3LITE_ACCESS_KEY=minioadmin
-      - S3LITE_SECRET_KEY=minioadmin
-      - S3LITE_AUTH_ENABLED=true
+      - GECKOS3_DATA_DIR=/data
+      - GECKOS3_LISTEN=:9000
+      - GECKOS3_ACCESS_KEY=geckoadmin
+      - GECKOS3_SECRET_KEY=geckoadmin
+      - GECKOS3_AUTH_ENABLED=true
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://localhost:9000/health"]

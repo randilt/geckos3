@@ -22,11 +22,11 @@ type Config struct {
 func main() {
 	config := &Config{}
 
-	flag.StringVar(&config.DataDir, "data-dir", getEnv("S3LITE_DATA_DIR", "./data"), "Root directory for buckets")
-	flag.StringVar(&config.ListenAddr, "listen", getEnv("S3LITE_LISTEN", ":9000"), "HTTP server address")
-	flag.StringVar(&config.AccessKey, "access-key", getEnv("S3LITE_ACCESS_KEY", "minioadmin"), "AWS access key")
-	flag.StringVar(&config.SecretKey, "secret-key", getEnv("S3LITE_SECRET_KEY", "minioadmin"), "AWS secret key")
-	flag.BoolVar(&config.AuthEnabled, "auth", getEnv("S3LITE_AUTH_ENABLED", "true") == "true", "Enable authentication")
+	flag.StringVar(&config.DataDir, "data-dir", getEnv("GECKOS3_DATA_DIR", "./data"), "Root directory for buckets")
+	flag.StringVar(&config.ListenAddr, "listen", getEnv("GECKOS3_LISTEN", ":9000"), "HTTP server address")
+	flag.StringVar(&config.AccessKey, "access-key", getEnv("GECKOS3_ACCESS_KEY", "geckoadmin"), "AWS access key")
+	flag.StringVar(&config.SecretKey, "secret-key", getEnv("GECKOS3_SECRET_KEY", "geckoadmin"), "AWS secret key")
+	flag.BoolVar(&config.AuthEnabled, "auth", getEnv("GECKOS3_AUTH_ENABLED", "true") == "true", "Enable authentication")
 	flag.Parse()
 
 	// Create data directory if it doesn't exist
@@ -41,8 +41,8 @@ func main() {
 	var auth Authenticator
 	if config.AuthEnabled {
 		auth = NewSigV4Authenticator(config.AccessKey, config.SecretKey)
-		if config.AccessKey == "minioadmin" || config.SecretKey == "minioadmin" {
-			log.Println("WARNING: Using default credentials. Set S3LITE_ACCESS_KEY and S3LITE_SECRET_KEY for production use.")
+		if config.AccessKey == "geckoadmin" || config.SecretKey == "geckoadmin" {
+			log.Println("WARNING: Using default credentials. Set GECKOS3_ACCESS_KEY and GECKOS3_SECRET_KEY for production use.")
 		}
 	} else {
 		auth = &NoOpAuthenticator{}

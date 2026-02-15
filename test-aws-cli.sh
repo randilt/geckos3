@@ -6,8 +6,8 @@ set -e
 
 ENDPOINT="http://localhost:9000"
 BUCKET="testbucket"
-ACCESS_KEY="minioadmin"
-SECRET_KEY="minioadmin"
+ACCESS_KEY="geckoadmin"
+SECRET_KEY="geckoadmin"
 
 echo "==> Configuring AWS CLI..."
 export AWS_ACCESS_KEY_ID=$ACCESS_KEY

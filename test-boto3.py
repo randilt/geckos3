@@ -10,8 +10,8 @@ import sys
 
 # Configuration
 ENDPOINT = 'http://localhost:9000'
-ACCESS_KEY = 'minioadmin'
-SECRET_KEY = 'minioadmin'
+ACCESS_KEY = 'geckoadmin'
+SECRET_KEY = 'geckoadmin'
 BUCKET = 'testbucket'
 
 def main():
