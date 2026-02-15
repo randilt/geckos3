@@ -1,0 +1,24 @@
+FROM alpine:latest
+
+RUN apk --no-cache add ca-certificates
+
+WORKDIR /app
+
+# Copy pre-built binary from GoReleaser
+COPY geckos3 .
+
+# Create data directory
+RUN mkdir -p /data
+
+# Volume for persistent storage
+VOLUME ["/data"]
+
+# Expose port
+EXPOSE 9000
+
+# Default configuration (overridable at runtime)
+ENV GECKOS3_DATA_DIR=/data \
+    GECKOS3_LISTEN=:9000
+
+# Run server
+CMD ["./geckos3"]

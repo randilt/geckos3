@@ -54,7 +54,7 @@ dockers:
   - image_templates:
       - "randiltharusha/geckos3:{{ .Version }}"
       - "randiltharusha/geckos3:latest"
-    dockerfile: Dockerfile
+    dockerfile: Dockerfile.goreleaser
     build_flag_templates:
       - "--pull"
       - "--label=org.opencontainers.image.created={{.Date}}"
