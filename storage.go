@@ -8,7 +8,9 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -32,7 +34,8 @@ type BucketInfo struct {
 }
 
 type FilesystemStorage struct {
-	dataDir string
+	dataDir    string
+	writeLocks sync.Map // map[string]*sync.Mutex for per-object write locks
 }
 
 type ObjectMetadata struct {
@@ -109,6 +112,14 @@ func (fs *FilesystemStorage) computeFileETag(path string) (string, error) {
 	return fmt.Sprintf("\"%s\"", hex.EncodeToString(h.Sum(nil))), nil
 }
 
+// generatePseudoETag generates a pseudo-ETag from file metadata without reading the file.
+// Used as fallback when .metadata.json is missing.
+func (fs *FilesystemStorage) generatePseudoETag(info os.FileInfo) string {
+	data := fmt.Sprintf("%d-%d", info.Size(), info.ModTime().UnixNano())
+	hash := md5.Sum([]byte(data))
+	return fmt.Sprintf("\"%x\"", hash)
+}
+
 // Bucket operations
 func (fs *FilesystemStorage) BucketExists(bucket string) bool {
 	if err := fs.validateBucketPath(bucket); err != nil {
@@ -179,8 +190,8 @@ func (fs *FilesystemStorage) ListObjects(bucket, prefix string, maxKeys int) ([]
 		return nil, fmt.Errorf("bucket does not exist")
 	}
 
-	var objects []ObjectInfo
-	count := 0
+	// Collect keys first without fetching metadata
+	var keys []string
 
 	err := filepath.WalkDir(bucketPath, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
@@ -206,15 +217,31 @@ func (fs *FilesystemStorage) ListObjects(bucket, prefix string, maxKeys int) ([]
 			return nil
 		}
 
-		// Apply maxKeys limit
-		if maxKeys > 0 && count >= maxKeys {
-			return filepath.SkipAll
-		}
+		keys = append(keys, key)
+		return nil
+	})
 
-		// Get object info
-		info, err := d.Info()
+	if err != nil {
+		return nil, err
+	}
+
+	// Sort keys lexicographically (S3 compliance)
+	sort.Strings(keys)
+
+	// Apply maxKeys pagination
+	if maxKeys > 0 && len(keys) > maxKeys {
+		keys = keys[:maxKeys]
+	}
+
+	// Now fetch metadata only for the keys in the current page
+	objects := make([]ObjectInfo, 0, len(keys))
+	for _, key := range keys {
+		objectPath := fs.objectPath(bucket, key)
+
+		info, err := os.Stat(objectPath)
 		if err != nil {
-			return err
+			// File was deleted between walk and now, skip it
+			continue
 		}
 
 		// Try to load metadata
@@ -223,9 +250,8 @@ func (fs *FilesystemStorage) ListObjects(bucket, prefix string, maxKeys int) ([]
 			etag = meta.ETag
 		}
 		if etag == "" {
-			if computed, hashErr := fs.computeFileETag(path); hashErr == nil {
-				etag = computed
-			}
+			// Use pseudo-ETag instead of reading entire file
+			etag = fs.generatePseudoETag(info)
 		}
 
 		objects = append(objects, ObjectInfo{
@@ -234,12 +260,9 @@ func (fs *FilesystemStorage) ListObjects(bucket, prefix string, maxKeys int) ([]
 			LastModified: info.ModTime(),
 			ETag:         etag,
 		})
-		count++
+	}
 
-		return nil
-	})
-
-	return objects, err
+	return objects, nil
 }
 
 // Object operations
@@ -249,10 +272,30 @@ func (fs *FilesystemStorage) PutObject(bucket, key string, reader io.Reader, con
 	}
 	objectPath := fs.objectPath(bucket, key)
 
-	// Create parent directories
+	// Acquire per-object lock to prevent concurrent write races
+	lockKey := objectPath
+	lockValue, _ := fs.writeLocks.LoadOrStore(lockKey, &sync.Mutex{})
+	mutex := lockValue.(*sync.Mutex)
+	mutex.Lock()
+	defer func() {
+		mutex.Unlock()
+		fs.writeLocks.Delete(lockKey)
+	}()
+
+	// Create parent directories with retry logic
 	dir := filepath.Dir(objectPath)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return nil, err
+	var mkdirErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		mkdirErr = os.MkdirAll(dir, 0755)
+		if mkdirErr == nil {
+			break
+		}
+		if attempt < 2 {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	if mkdirErr != nil {
+		return nil, mkdirErr
 	}
 
 	// Write to unique temporary file to avoid concurrent write races
@@ -285,7 +328,7 @@ func (fs *FilesystemStorage) PutObject(bucket, key string, reader io.Reader, con
 		return nil, err
 	}
 
-	// Atomic rename
+	// Atomic rename for data file
 	if err := os.Rename(tempPath, objectPath); err != nil {
 		os.Remove(tempPath)
 		return nil, err
@@ -303,7 +346,7 @@ func (fs *FilesystemStorage) PutObject(bucket, key string, reader io.Reader, con
 		ContentType:  contentType,
 	}
 
-	// Save metadata
+	// Save metadata (also protected by the same lock)
 	if err := fs.saveMetadata(bucket, key, metadata); err != nil {
 		// Non-fatal - object is saved
 		return metadata, nil
@@ -332,15 +375,11 @@ func (fs *FilesystemStorage) GetObject(bucket, key string) (io.ReadCloser, *Obje
 	// Try to load metadata
 	metadata, err := fs.loadMetadata(bucket, key)
 	if err != nil {
-		// Fallback: compute ETag from file content
-		etag, hashErr := fs.computeFileETag(objectPath)
-		if hashErr != nil {
-			etag = ""
-		}
+		// Use pseudo-ETag instead of reading entire file
 		metadata = &ObjectMetadata{
 			Size:         info.Size(),
 			LastModified: info.ModTime(),
-			ETag:         etag,
+			ETag:         fs.generatePseudoETag(info),
 		}
 	}
 
@@ -361,15 +400,11 @@ func (fs *FilesystemStorage) HeadObject(bucket, key string) (*ObjectMetadata, er
 	// Try to load metadata
 	metadata, err := fs.loadMetadata(bucket, key)
 	if err != nil {
-		// Fallback: compute ETag from file content
-		etag, hashErr := fs.computeFileETag(objectPath)
-		if hashErr != nil {
-			etag = ""
-		}
+		// Use pseudo-ETag instead of reading entire file
 		metadata = &ObjectMetadata{
 			Size:         info.Size(),
 			LastModified: info.ModTime(),
-			ETag:         etag,
+			ETag:         fs.generatePseudoETag(info),
 		}
 	}
 

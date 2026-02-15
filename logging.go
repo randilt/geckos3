@@ -11,22 +11,27 @@ import (
 
 var requestCounter atomic.Int64
 
-type responseWriter struct {
+type responseWriterWithRequest struct {
 	http.ResponseWriter
 	statusCode int
 	written    int64
+	request    *http.Request
 }
 
-func (rw *responseWriter) WriteHeader(code int) {
+func (rw *responseWriterWithRequest) WriteHeader(code int) {
 	rw.statusCode = code
 	rw.ResponseWriter.WriteHeader(code)
 }
 
-func (rw *responseWriter) Write(b []byte) (int, error) {
+func (rw *responseWriterWithRequest) Write(b []byte) (int, error) {
 	n, err := rw.ResponseWriter.Write(b)
 	rw.written += int64(n)
 	return n, err
 }
+
+type contextKey string
+
+const errorContextKey contextKey = "geckos3-error"
 
 type LogEntry struct {
 	Timestamp string `json:"timestamp"`
@@ -37,6 +42,7 @@ type LogEntry struct {
 	Duration  int64  `json:"duration_ms"`
 	Bytes     int64  `json:"bytes,omitempty"`
 	ClientIP  string `json:"client_ip"`
+	Error     string `json:"error,omitempty"` // Log errors
 }
 
 func LoggingMiddleware(next http.Handler) http.Handler {
@@ -50,9 +56,10 @@ func LoggingMiddleware(next http.Handler) http.Handler {
 		w.Header().Set("x-amz-request-id", reqID)
 
 		// Wrap response writer
-		rw := &responseWriter{
+		rw := &responseWriterWithRequest{
 			ResponseWriter: w,
 			statusCode:     http.StatusOK,
+			request:        r,
 		}
 
 		// Call next handler
@@ -70,6 +77,13 @@ func LoggingMiddleware(next http.Handler) http.Handler {
 			Duration:  duration,
 			Bytes:     rw.written,
 			ClientIP:  r.RemoteAddr,
+		}
+
+		// Extract error from context if present
+		if errVal := r.Context().Value(errorContextKey); errVal != nil {
+			if errStr, ok := errVal.(string); ok {
+				entry.Error = errStr
+			}
 		}
 
 		// Write JSON log line to stdout

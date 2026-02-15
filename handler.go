@@ -1,8 +1,10 @@
 package main
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/xml"
+	"fmt"
 	"io"
 	"net/http"
 	"sort"
@@ -14,6 +16,19 @@ import (
 type S3Handler struct {
 	storage Storage
 	auth    Authenticator
+}
+
+// MaxClientsMiddleware limits concurrent requests using a semaphore
+func MaxClientsMiddleware(maxClients int) func(http.Handler) http.Handler {
+	semaphore := make(chan struct{}, maxClients)
+
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			semaphore <- struct{}{}        // Acquire
+			defer func() { <-semaphore }() // Release
+			next.ServeHTTP(w, r)
+		})
+	}
 }
 
 func NewS3Handler(storage Storage, auth Authenticator) *S3Handler {
@@ -33,7 +48,7 @@ func (h *S3Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Authenticate request
 	if err := h.auth.Authenticate(r); err != nil {
-		h.writeError(w, "AccessDenied", err.Error(), http.StatusForbidden)
+		h.writeError(w, r, "AccessDenied", err.Error(), http.StatusForbidden)
 		return
 	}
 
@@ -46,7 +61,7 @@ func (h *S3Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet {
 			h.handleListBuckets(w, r)
 		} else {
-			h.writeError(w, "NotImplemented", "Service operation not supported", http.StatusNotImplemented)
+			h.writeError(w, r, "NotImplemented", "Service operation not supported", http.StatusNotImplemented)
 		}
 		return
 	}
@@ -73,7 +88,7 @@ func (h *S3Handler) handleBucketOperation(w http.ResponseWriter, r *http.Request
 		if r.URL.Query().Has("delete") {
 			h.handleDeleteObjects(w, r, bucket)
 		} else {
-			h.writeError(w, "NotImplemented", "Operation not supported", http.StatusNotImplemented)
+			h.writeError(w, r, "NotImplemented", "Operation not supported", http.StatusNotImplemented)
 		}
 	case http.MethodGet:
 		if r.URL.Query().Get("list-type") == "2" {
@@ -82,7 +97,7 @@ func (h *S3Handler) handleBucketOperation(w http.ResponseWriter, r *http.Request
 			h.handleListObjectsV1(w, r, bucket)
 		}
 	default:
-		h.writeError(w, "MethodNotAllowed", "Method not allowed", http.StatusMethodNotAllowed)
+		h.writeError(w, r, "MethodNotAllowed", "Method not allowed", http.StatusMethodNotAllowed)
 	}
 }
 
@@ -102,14 +117,14 @@ func (h *S3Handler) handleObjectOperation(w http.ResponseWriter, r *http.Request
 	case http.MethodDelete:
 		h.handleDeleteObject(w, r, bucket, key)
 	default:
-		h.writeError(w, "MethodNotAllowed", "Method not allowed", http.StatusMethodNotAllowed)
+		h.writeError(w, r, "MethodNotAllowed", "Method not allowed", http.StatusMethodNotAllowed)
 	}
 }
 
 // Bucket handlers
 func (h *S3Handler) handleCreateBucket(w http.ResponseWriter, r *http.Request, bucket string) {
 	if !isValidBucketName(bucket) {
-		h.writeError(w, "InvalidBucketName", "The specified bucket is not valid", http.StatusBadRequest)
+		h.writeError(w, r, "InvalidBucketName", "The specified bucket is not valid", http.StatusBadRequest)
 		return
 	}
 
@@ -121,7 +136,7 @@ func (h *S3Handler) handleCreateBucket(w http.ResponseWriter, r *http.Request, b
 	}
 
 	if err := h.storage.CreateBucket(bucket); err != nil {
-		h.writeError(w, "InternalError", err.Error(), http.StatusInternalServerError)
+		h.writeError(w, r, "InternalError", err.Error(), http.StatusInternalServerError)
 		return
 	}
 
@@ -131,12 +146,12 @@ func (h *S3Handler) handleCreateBucket(w http.ResponseWriter, r *http.Request, b
 
 func (h *S3Handler) handleDeleteBucket(w http.ResponseWriter, r *http.Request, bucket string) {
 	if !h.storage.BucketExists(bucket) {
-		h.writeError(w, "NoSuchBucket", "The specified bucket does not exist", http.StatusNotFound)
+		h.writeError(w, r, "NoSuchBucket", "The specified bucket does not exist", http.StatusNotFound)
 		return
 	}
 
 	if err := h.storage.DeleteBucket(bucket); err != nil {
-		h.writeError(w, "BucketNotEmpty", "The bucket you tried to delete is not empty", http.StatusConflict)
+		h.writeError(w, r, "BucketNotEmpty", "The bucket you tried to delete is not empty", http.StatusConflict)
 		return
 	}
 
@@ -145,7 +160,7 @@ func (h *S3Handler) handleDeleteBucket(w http.ResponseWriter, r *http.Request, b
 
 func (h *S3Handler) handleHeadBucket(w http.ResponseWriter, r *http.Request, bucket string) {
 	if !h.storage.BucketExists(bucket) {
-		h.writeError(w, "NoSuchBucket", "The specified bucket does not exist", http.StatusNotFound)
+		h.writeError(w, r, "NoSuchBucket", "The specified bucket does not exist", http.StatusNotFound)
 		return
 	}
 
@@ -154,7 +169,7 @@ func (h *S3Handler) handleHeadBucket(w http.ResponseWriter, r *http.Request, buc
 
 func (h *S3Handler) handleListObjectsV2(w http.ResponseWriter, r *http.Request, bucket string) {
 	if !h.storage.BucketExists(bucket) {
-		h.writeError(w, "NoSuchBucket", "The specified bucket does not exist", http.StatusNotFound)
+		h.writeError(w, r, "NoSuchBucket", "The specified bucket does not exist", http.StatusNotFound)
 		return
 	}
 
@@ -184,7 +199,7 @@ func (h *S3Handler) handleListObjectsV2(w http.ResponseWriter, r *http.Request, 
 	// Get all matching objects for correct pagination
 	objects, err := h.storage.ListObjects(bucket, prefix, 0)
 	if err != nil {
-		h.writeError(w, "InternalError", err.Error(), http.StatusInternalServerError)
+		h.writeError(w, r, "InternalError", err.Error(), http.StatusInternalServerError)
 		return
 	}
 
@@ -283,14 +298,14 @@ func (h *S3Handler) handleListObjectsV2(w http.ResponseWriter, r *http.Request, 
 // Object handlers
 func (h *S3Handler) handlePutObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
 	if !h.storage.BucketExists(bucket) {
-		h.writeError(w, "NoSuchBucket", "The specified bucket does not exist", http.StatusNotFound)
+		h.writeError(w, r, "NoSuchBucket", "The specified bucket does not exist", http.StatusNotFound)
 		return
 	}
 
 	contentType := r.Header.Get("Content-Type")
 	metadata, err := h.storage.PutObject(bucket, key, r.Body, contentType)
 	if err != nil {
-		h.writeError(w, "InternalError", err.Error(), http.StatusInternalServerError)
+		h.writeError(w, r, "InternalError", err.Error(), http.StatusInternalServerError)
 		return
 	}
 
@@ -301,7 +316,7 @@ func (h *S3Handler) handlePutObject(w http.ResponseWriter, r *http.Request, buck
 func (h *S3Handler) handleGetObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
 	reader, metadata, err := h.storage.GetObject(bucket, key)
 	if err != nil {
-		h.writeError(w, "NoSuchKey", "The specified key does not exist", http.StatusNotFound)
+		h.writeError(w, r, "NoSuchKey", "The specified key does not exist", http.StatusNotFound)
 		return
 	}
 	defer reader.Close()
@@ -332,7 +347,7 @@ func (h *S3Handler) handleGetObject(w http.ResponseWriter, r *http.Request, buck
 func (h *S3Handler) handleHeadObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
 	metadata, err := h.storage.HeadObject(bucket, key)
 	if err != nil {
-		h.writeError(w, "NoSuchKey", "The specified key does not exist", http.StatusNotFound)
+		h.writeError(w, r, "NoSuchKey", "The specified key does not exist", http.StatusNotFound)
 		return
 	}
 
@@ -351,7 +366,7 @@ func (h *S3Handler) handleHeadObject(w http.ResponseWriter, r *http.Request, buc
 
 func (h *S3Handler) handleDeleteObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
 	if err := h.storage.DeleteObject(bucket, key); err != nil {
-		h.writeError(w, "InternalError", err.Error(), http.StatusInternalServerError)
+		h.writeError(w, r, "InternalError", err.Error(), http.StatusInternalServerError)
 		return
 	}
 
@@ -362,7 +377,7 @@ func (h *S3Handler) handleDeleteObject(w http.ResponseWriter, r *http.Request, b
 func (h *S3Handler) handleListBuckets(w http.ResponseWriter, r *http.Request) {
 	buckets, err := h.storage.ListBuckets()
 	if err != nil {
-		h.writeError(w, "InternalError", err.Error(), http.StatusInternalServerError)
+		h.writeError(w, r, "InternalError", err.Error(), http.StatusInternalServerError)
 		return
 	}
 
@@ -385,7 +400,7 @@ func (h *S3Handler) handleListBuckets(w http.ResponseWriter, r *http.Request) {
 // ListObjectsV1 handler
 func (h *S3Handler) handleListObjectsV1(w http.ResponseWriter, r *http.Request, bucket string) {
 	if !h.storage.BucketExists(bucket) {
-		h.writeError(w, "NoSuchBucket", "The specified bucket does not exist", http.StatusNotFound)
+		h.writeError(w, r, "NoSuchBucket", "The specified bucket does not exist", http.StatusNotFound)
 		return
 	}
 
@@ -404,7 +419,7 @@ func (h *S3Handler) handleListObjectsV1(w http.ResponseWriter, r *http.Request, 
 
 	objects, err := h.storage.ListObjects(bucket, prefix, 0)
 	if err != nil {
-		h.writeError(w, "InternalError", err.Error(), http.StatusInternalServerError)
+		h.writeError(w, r, "InternalError", err.Error(), http.StatusInternalServerError)
 		return
 	}
 
@@ -496,24 +511,24 @@ func (h *S3Handler) handleCopyObject(w http.ResponseWriter, r *http.Request, dst
 	copySource = strings.TrimPrefix(copySource, "/")
 	parts := strings.SplitN(copySource, "/", 2)
 	if len(parts) < 2 || parts[1] == "" {
-		h.writeError(w, "InvalidArgument", "Invalid x-amz-copy-source", http.StatusBadRequest)
+		h.writeError(w, r, "InvalidArgument", "Invalid x-amz-copy-source", http.StatusBadRequest)
 		return
 	}
 	srcBucket := parts[0]
 	srcKey := parts[1]
 
 	if !h.storage.BucketExists(srcBucket) {
-		h.writeError(w, "NoSuchBucket", "The source bucket does not exist", http.StatusNotFound)
+		h.writeError(w, r, "NoSuchBucket", "The source bucket does not exist", http.StatusNotFound)
 		return
 	}
 	if !h.storage.BucketExists(dstBucket) {
-		h.writeError(w, "NoSuchBucket", "The destination bucket does not exist", http.StatusNotFound)
+		h.writeError(w, r, "NoSuchBucket", "The destination bucket does not exist", http.StatusNotFound)
 		return
 	}
 
 	metadata, err := h.storage.CopyObject(srcBucket, srcKey, dstBucket, dstKey)
 	if err != nil {
-		h.writeError(w, "NoSuchKey", "The specified source key does not exist", http.StatusNotFound)
+		h.writeError(w, r, "NoSuchKey", "The specified source key does not exist", http.StatusNotFound)
 		return
 	}
 
@@ -528,20 +543,20 @@ func (h *S3Handler) handleCopyObject(w http.ResponseWriter, r *http.Request, dst
 // DeleteObjects (batch) handler
 func (h *S3Handler) handleDeleteObjects(w http.ResponseWriter, r *http.Request, bucket string) {
 	if !h.storage.BucketExists(bucket) {
-		h.writeError(w, "NoSuchBucket", "The specified bucket does not exist", http.StatusNotFound)
+		h.writeError(w, r, "NoSuchBucket", "The specified bucket does not exist", http.StatusNotFound)
 		return
 	}
 
 	// Parse request body
-	body, err := io.ReadAll(io.LimitReader(r.Body, 10*1024*1024)) // 10MB limit
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1*1024*1024)) // 1MB limit (reduced from 10MB)
 	if err != nil {
-		h.writeError(w, "InternalError", "Failed to read request body", http.StatusInternalServerError)
+		h.writeError(w, r, "InternalError", "Failed to read request body", http.StatusInternalServerError)
 		return
 	}
 
 	var deleteReq DeleteRequest
 	if err := xml.Unmarshal(body, &deleteReq); err != nil {
-		h.writeError(w, "MalformedXML", "The XML you provided was not well-formed", http.StatusBadRequest)
+		h.writeError(w, r, "MalformedXML", "The XML you provided was not well-formed", http.StatusBadRequest)
 		return
 	}
 
@@ -590,7 +605,11 @@ func (h *S3Handler) parsePath(path string) (bucket, key string) {
 	return bucket, key
 }
 
-func (h *S3Handler) writeError(w http.ResponseWriter, code, message string, status int) {
+func (h *S3Handler) writeError(w http.ResponseWriter, r *http.Request, code, message string, status int) {
+	// Store error in request context for logging
+	ctx := context.WithValue(r.Context(), errorContextKey, fmt.Sprintf("%s: %s", code, message))
+	*r = *r.WithContext(ctx)
+
 	errorResponse := ErrorResponse{
 		Code:    code,
 		Message: message,

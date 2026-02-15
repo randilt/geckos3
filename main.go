@@ -68,8 +68,8 @@ func main() {
 	// Initialize handler
 	handler := NewS3Handler(storage, auth)
 
-	// Wrap with logging middleware
-	loggedHandler := LoggingMiddleware(handler)
+	// Wrap with logging middleware and concurrency limit
+	loggedHandler := LoggingMiddleware(MaxClientsMiddleware(1024)(handler))
 
 	server := &http.Server{
 		Addr:              config.ListenAddr,

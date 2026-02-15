@@ -90,6 +90,10 @@ func (a *SigV4Authenticator) authenticatePresigned(r *http.Request) error {
 		if err != nil || expiresSec < 0 {
 			return fmt.Errorf("request has expired")
 		}
+		// Cap presigned URL expiry at 7 days (604800 seconds)
+		if expiresSec > 604800 {
+			return fmt.Errorf("X-Amz-Expires must be less than 604800 seconds")
+		}
 		if time.Now().After(reqTime.Add(time.Duration(expiresSec) * time.Second)) {
 			return fmt.Errorf("request has expired")
 		}
