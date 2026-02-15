@@ -22,6 +22,45 @@ docker run -d -p 9000:9000 \
   randiltharusha/geckos3:latest
 ```
 
+### Download Pre-built Binary
+
+Download the latest release for your platform from [GitHub Releases](https://github.com/randilt/geckos3/releases):
+
+**Linux (x86_64):**
+
+```bash
+wget https://github.com/randilt/geckos3/releases/download/v0.1.0/geckos3_0.1.0_Linux_x86_64.tar.gz
+tar -xzf geckos3_0.1.0_Linux_x86_64.tar.gz
+chmod +x geckos3
+./geckos3
+```
+
+**macOS (Apple Silicon):**
+
+```bash
+wget https://github.com/randilt/geckos3/releases/download/v0.1.0/geckos3_0.1.0_Darwin_arm64.tar.gz
+tar -xzf geckos3_0.1.0_Darwin_arm64.tar.gz
+chmod +x geckos3
+./geckos3
+```
+
+**macOS (Intel):**
+
+```bash
+wget https://github.com/randilt/geckos3/releases/download/v0.1.0/geckos3_0.1.0_Darwin_x86_64.tar.gz
+tar -xzf geckos3_0.1.0_Darwin_x86_64.tar.gz
+chmod +x geckos3
+./geckos3
+```
+
+**Windows (PowerShell):**
+
+```powershell
+Invoke-WebRequest -Uri "https://github.com/randilt/geckos3/releases/download/v0.1.0/geckos3_0.1.0_Windows_x86_64.tar.gz" -OutFile "geckos3.tar.gz"
+tar -xzf geckos3.tar.gz
+.\geckos3.exe
+```
+
 ### Build from Source
 
 ```bash
@@ -34,6 +73,24 @@ go build -o geckos3
 ```
 
 Server starts on `http://localhost:9000` with default credentials `geckoadmin`/`geckoadmin`.
+
+### Check Version
+
+```bash
+./geckos3 -version
+```
+
+### Install to System (Optional)
+
+**Linux/macOS:**
+
+```bash
+sudo install -m 755 geckos3 /usr/local/bin/
+# Now run from anywhere
+geckos3
+```
+
+**Windows:** Add the directory containing `geckos3.exe` to your PATH environment variable.
 
 ## Configuration
 
