@@ -21,11 +21,12 @@ var (
 )
 
 type Config struct {
-	DataDir     string
-	ListenAddr  string
-	AccessKey   string
-	SecretKey   string
-	AuthEnabled bool
+	DataDir      string
+	ListenAddr   string
+	AccessKey    string
+	SecretKey    string
+	AuthEnabled  bool
+	FsyncEnabled bool
 }
 
 func main() {
@@ -38,6 +39,7 @@ func main() {
 	flag.StringVar(&config.AccessKey, "access-key", getEnv("GECKOS3_ACCESS_KEY", "geckoadmin"), "AWS access key")
 	flag.StringVar(&config.SecretKey, "secret-key", getEnv("GECKOS3_SECRET_KEY", "geckoadmin"), "AWS secret key")
 	flag.BoolVar(&config.AuthEnabled, "auth", parseBoolEnv("GECKOS3_AUTH_ENABLED", true), "Enable authentication")
+	flag.BoolVar(&config.FsyncEnabled, "fsync", parseBoolEnv("GECKOS3_FSYNC", false), "Fsync files and directories after writes (slower, stronger durability)")
 	flag.Parse()
 
 	if showVersion {
@@ -54,6 +56,10 @@ func main() {
 
 	// Initialize storage layer
 	storage := NewFilesystemStorage(config.DataDir)
+	if config.FsyncEnabled {
+		storage.SetFsync(true)
+		log.Println("Fsync enabled: per-object durability mode (slower writes)")
+	}
 
 	// Initialize auth layer
 	var auth Authenticator

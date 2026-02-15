@@ -65,8 +65,9 @@ type BucketInfo struct {
 // Lock striping with a fixed array of mutexes prevents concurrent write races
 // without unbounded memory growth from per-key locks.
 type FilesystemStorage struct {
-	dataDir string
-	stripes [lockStripes]sync.Mutex
+	dataDir     string
+	stripes     [lockStripes]sync.Mutex
+	enableFsync bool // When true, fsync files and directories after writes
 }
 
 type ObjectMetadata struct {
@@ -105,6 +106,13 @@ type CompletedPart struct {
 
 func NewFilesystemStorage(dataDir string) *FilesystemStorage {
 	return &FilesystemStorage{dataDir: dataDir}
+}
+
+// SetFsync enables or disables per-object fsync. When disabled (default),
+// writes rely on OS page cache and atomic rename for consistency, matching
+// the behavior of MinIO and other high-performance object stores.
+func (fs *FilesystemStorage) SetFsync(enabled bool) {
+	fs.enableFsync = enabled
 }
 
 // stripe returns the mutex for a given key using FNV-1a hashing.
@@ -394,10 +402,12 @@ func (fs *FilesystemStorage) PutObject(bucket, key string, reader io.Reader, inp
 		return nil, err
 	}
 
-	if err := tempFile.Sync(); err != nil {
-		tempFile.Close()
-		os.Remove(tempPath)
-		return nil, err
+	if fs.enableFsync {
+		if err := tempFile.Sync(); err != nil {
+			tempFile.Close()
+			os.Remove(tempPath)
+			return nil, err
+		}
 	}
 	if err := tempFile.Close(); err != nil {
 		os.Remove(tempPath)
@@ -428,7 +438,9 @@ func (fs *FilesystemStorage) PutObject(bucket, key string, reader io.Reader, inp
 		os.Remove(tempPath)
 		return nil, err
 	}
-	syncParentDir(objectPath)
+	if fs.enableFsync {
+		syncParentDir(objectPath)
+	}
 	mu.Unlock()
 
 	// Build metadata from input
@@ -649,10 +661,12 @@ func (fs *FilesystemStorage) UploadPart(bucket, key, uploadID string, partNumber
 		return "", err
 	}
 
-	if err := tempFile.Sync(); err != nil {
-		tempFile.Close()
-		os.Remove(tempPath)
-		return "", err
+	if fs.enableFsync {
+		if err := tempFile.Sync(); err != nil {
+			tempFile.Close()
+			os.Remove(tempPath)
+			return "", err
+		}
 	}
 	if err := tempFile.Close(); err != nil {
 		os.Remove(tempPath)
@@ -727,10 +741,12 @@ func (fs *FilesystemStorage) CompleteMultipartUpload(bucket, key, uploadID strin
 		totalSize += n
 	}
 
-	if err := tempFile.Sync(); err != nil {
-		tempFile.Close()
-		os.Remove(tempPath)
-		return nil, err
+	if fs.enableFsync {
+		if err := tempFile.Sync(); err != nil {
+			tempFile.Close()
+			os.Remove(tempPath)
+			return nil, err
+		}
 	}
 	if err := tempFile.Close(); err != nil {
 		os.Remove(tempPath)
@@ -751,7 +767,9 @@ func (fs *FilesystemStorage) CompleteMultipartUpload(bucket, key, uploadID strin
 		os.Remove(tempPath)
 		return nil, err
 	}
-	syncParentDir(objectPath)
+	if fs.enableFsync {
+		syncParentDir(objectPath)
+	}
 	mu.Unlock()
 
 	// Build S3-style multipart ETag: MD5-of-data + "-N"
