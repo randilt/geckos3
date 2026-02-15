@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"io"
 	"os"
 	"path/filepath"
@@ -1447,6 +1449,335 @@ func TestLockStripeDifferentKeys(t *testing.T) {
 			t.Fatal("stripe returned nil")
 		}
 	}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Fix 2: SHA256 Verification in Storage Layer
+// ═══════════════════════════════════════════════════════════════════════════════
+
+func TestPutObjectExpectedSHA256Correct(t *testing.T) {
+	s, cleanup := setupTestStorage(t)
+	defer cleanup()
+	s.CreateBucket("b")
+
+	payload := []byte("verified content")
+	hash := sha256.Sum256(payload)
+	hashHex := hex.EncodeToString(hash[:])
+
+	meta, err := s.PutObject("b", "verified.txt", bytes.NewReader(payload), &PutObjectInput{
+		ExpectedSHA256: hashHex,
+	})
+	if err != nil {
+		t.Fatalf("correct SHA256 should succeed: %v", err)
+	}
+	if meta.Size != int64(len(payload)) {
+		t.Errorf("size: got %d, want %d", meta.Size, len(payload))
+	}
+
+	// Verify content was written
+	r, _, err := s.GetObject("b", "verified.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	data, _ := io.ReadAll(r)
+	if string(data) != "verified content" {
+		t.Errorf("content mismatch: %q", data)
+	}
+}
+
+func TestPutObjectExpectedSHA256Wrong(t *testing.T) {
+	s, cleanup := setupTestStorage(t)
+	defer cleanup()
+	s.CreateBucket("b")
+
+	payload := []byte("actual content")
+	wrongHash := hex.EncodeToString(sha256.New().Sum(nil)) // hash of empty
+
+	_, err := s.PutObject("b", "bad.txt", bytes.NewReader(payload), &PutObjectInput{
+		ExpectedSHA256: wrongHash,
+	})
+	if err != ErrBadDigest {
+		t.Fatalf("wrong SHA256 should return ErrBadDigest, got: %v", err)
+	}
+
+	// Object must NOT exist — never committed
+	_, _, getErr := s.GetObject("b", "bad.txt")
+	if getErr == nil {
+		t.Error("object should not exist after bad digest")
+	}
+}
+
+func TestPutObjectSHA256DoesNotOverwriteExisting(t *testing.T) {
+	s, cleanup := setupTestStorage(t)
+	defer cleanup()
+	s.CreateBucket("b")
+
+	// Write a valid object first
+	s.PutObject("b", "keep.txt", strings.NewReader("original"), nil)
+
+	// Attempt to overwrite with wrong SHA256
+	wrongHash := hex.EncodeToString(sha256.New().Sum(nil))
+	_, err := s.PutObject("b", "keep.txt", strings.NewReader("replacement"), &PutObjectInput{
+		ExpectedSHA256: wrongHash,
+	})
+	if err != ErrBadDigest {
+		t.Fatalf("expected ErrBadDigest, got: %v", err)
+	}
+
+	// Original object must survive untouched
+	r, _, _ := s.GetObject("b", "keep.txt")
+	defer r.Close()
+	data, _ := io.ReadAll(r)
+	if string(data) != "original" {
+		t.Errorf("original content should survive bad-digest attempt: got %q", data)
+	}
+}
+
+func TestPutObjectEmptySHA256FieldSkipsVerification(t *testing.T) {
+	s, cleanup := setupTestStorage(t)
+	defer cleanup()
+	s.CreateBucket("b")
+
+	// ExpectedSHA256 is empty — no verification
+	meta, err := s.PutObject("b", "nocheck.txt", strings.NewReader("anything"), &PutObjectInput{
+		ExpectedSHA256: "",
+	})
+	if err != nil {
+		t.Fatalf("empty ExpectedSHA256 should skip verification: %v", err)
+	}
+	if meta.Size != 8 {
+		t.Errorf("size: %d", meta.Size)
+	}
+}
+
+func TestPutObjectSHA256EmptyBodyCorrect(t *testing.T) {
+	s, cleanup := setupTestStorage(t)
+	defer cleanup()
+	s.CreateBucket("b")
+
+	hash := sha256.Sum256([]byte{})
+	hashHex := hex.EncodeToString(hash[:])
+
+	meta, err := s.PutObject("b", "empty.txt", bytes.NewReader(nil), &PutObjectInput{
+		ExpectedSHA256: hashHex,
+	})
+	if err != nil {
+		t.Fatalf("empty body with correct SHA256 should succeed: %v", err)
+	}
+	if meta.Size != 0 {
+		t.Errorf("size: %d", meta.Size)
+	}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Fix 3: Temp File Staging Directory (.geckos3-tmp)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+func TestTmpStagingDirCreatedOnPut(t *testing.T) {
+	s, cleanup := setupTestStorage(t)
+	defer cleanup()
+	s.CreateBucket("b")
+
+	s.PutObject("b", "file.txt", strings.NewReader("data"), nil)
+
+	// The staging dir should exist after a PutObject
+	stagingPath := filepath.Join(s.dataDir, "b", tmpStagingDir)
+	info, err := os.Stat(stagingPath)
+	if err != nil {
+		t.Fatalf(".geckos3-tmp should be created: %v", err)
+	}
+	if !info.IsDir() {
+		t.Error(".geckos3-tmp should be a directory")
+	}
+}
+
+func TestTmpStagingDirNotInListing(t *testing.T) {
+	s, cleanup := setupTestStorage(t)
+	defer cleanup()
+	s.CreateBucket("b")
+
+	s.PutObject("b", "file.txt", strings.NewReader("data"), nil)
+
+	objects, err := s.ListObjects("b", "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, obj := range objects {
+		if strings.Contains(obj.Key, tmpStagingDir) {
+			t.Errorf(".geckos3-tmp should not appear in listing, found: %s", obj.Key)
+		}
+	}
+	if len(objects) != 1 || objects[0].Key != "file.txt" {
+		t.Errorf("listing should have exactly [file.txt], got: %v", objects)
+	}
+}
+
+func TestTmpStagingDirNoLeftoverAfterPut(t *testing.T) {
+	s, cleanup := setupTestStorage(t)
+	defer cleanup()
+	s.CreateBucket("b")
+
+	// Write several objects
+	for i := 0; i < 10; i++ {
+		s.PutObject("b", strings.Repeat("x", i+1)+".txt", strings.NewReader("data"), nil)
+	}
+
+	// Staging dir should have no leftover temp files
+	stagingPath := filepath.Join(s.dataDir, "b", tmpStagingDir)
+	entries, err := os.ReadDir(stagingPath)
+	if err != nil {
+		t.Fatalf("cannot read staging dir: %v", err)
+	}
+	if len(entries) > 0 {
+		names := make([]string, len(entries))
+		for i, e := range entries {
+			names[i] = e.Name()
+		}
+		t.Errorf("staging dir should be empty after successful puts, found: %v", names)
+	}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Fix 5: DeleteBucket Ignores OS Artifacts
+// ═══════════════════════════════════════════════════════════════════════════════
+
+func TestDeleteBucketWithDSStore(t *testing.T) {
+	s, cleanup := setupTestStorage(t)
+	defer cleanup()
+	s.CreateBucket("b")
+
+	// Create .DS_Store artifact
+	dsStorePath := filepath.Join(s.dataDir, "b", ".DS_Store")
+	os.WriteFile(dsStorePath, []byte("Bud1\x00"), 0644)
+
+	// DeleteBucket should succeed despite .DS_Store
+	if err := s.DeleteBucket("b"); err != nil {
+		t.Fatalf("DeleteBucket with .DS_Store should succeed: %v", err)
+	}
+	if s.BucketExists("b") {
+		t.Error("bucket should be gone after delete")
+	}
+}
+
+func TestDeleteBucketWithThumbsDb(t *testing.T) {
+	s, cleanup := setupTestStorage(t)
+	defer cleanup()
+	s.CreateBucket("b")
+
+	thumbsPath := filepath.Join(s.dataDir, "b", "Thumbs.db")
+	os.WriteFile(thumbsPath, []byte("thumb"), 0644)
+
+	if err := s.DeleteBucket("b"); err != nil {
+		t.Fatalf("DeleteBucket with Thumbs.db should succeed: %v", err)
+	}
+}
+
+func TestDeleteBucketWithStagingDirs(t *testing.T) {
+	s, cleanup := setupTestStorage(t)
+	defer cleanup()
+	s.CreateBucket("b")
+
+	// Create both staging directories
+	os.MkdirAll(filepath.Join(s.dataDir, "b", multipartStagingDir), 0755)
+	os.MkdirAll(filepath.Join(s.dataDir, "b", tmpStagingDir), 0755)
+
+	if err := s.DeleteBucket("b"); err != nil {
+		t.Fatalf("DeleteBucket with staging dirs should succeed: %v", err)
+	}
+}
+
+func TestDeleteBucketWithAllArtifactsCombined(t *testing.T) {
+	s, cleanup := setupTestStorage(t)
+	defer cleanup()
+	s.CreateBucket("b")
+
+	// Create all possible hidden entries at once
+	os.MkdirAll(filepath.Join(s.dataDir, "b", multipartStagingDir), 0755)
+	os.MkdirAll(filepath.Join(s.dataDir, "b", tmpStagingDir), 0755)
+	os.WriteFile(filepath.Join(s.dataDir, "b", ".DS_Store"), []byte("x"), 0644)
+	os.WriteFile(filepath.Join(s.dataDir, "b", "Thumbs.db"), []byte("x"), 0644)
+
+	if err := s.DeleteBucket("b"); err != nil {
+		t.Fatalf("DeleteBucket with all artifacts should succeed: %v", err)
+	}
+}
+
+func TestDeleteBucketStillFailsWithRealObjects(t *testing.T) {
+	s, cleanup := setupTestStorage(t)
+	defer cleanup()
+	s.CreateBucket("b")
+
+	// Add artifacts AND a real object
+	os.WriteFile(filepath.Join(s.dataDir, "b", ".DS_Store"), []byte("x"), 0644)
+	s.PutObject("b", "real.txt", strings.NewReader("real"), nil)
+
+	if err := s.DeleteBucket("b"); err == nil {
+		t.Fatal("DeleteBucket should fail when real objects exist even with artifacts")
+	}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Fix 1: I/O Outside Stripe Lock – Concurrent Stress
+// ═══════════════════════════════════════════════════════════════════════════════
+
+func TestConcurrentPutsDifferentBucketsSameStripe(t *testing.T) {
+	s, cleanup := setupTestStorage(t)
+	defer cleanup()
+
+	// Create multiple buckets and hammer concurrent writes to verify
+	// that I/O outside the lock doesn't cause deadlocks
+	for i := 0; i < 4; i++ {
+		s.CreateBucket(strings.Repeat("b", i+1))
+	}
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 200)
+
+	for i := 0; i < 200; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			bucket := strings.Repeat("b", (n%4)+1)
+			key := strings.Repeat("k", (n%10)+1) + ".txt"
+			content := strings.Repeat("data", n+1)
+			_, err := s.PutObject(bucket, key, strings.NewReader(content), nil)
+			if err != nil {
+				errs <- err
+			}
+		}(i)
+	}
+
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		t.Errorf("concurrent put failed: %v", err)
+	}
+}
+
+func TestConcurrentPutAndDeleteNoDeadlock(t *testing.T) {
+	s, cleanup := setupTestStorage(t)
+	defer cleanup()
+	s.CreateBucket("b")
+
+	// Write and delete the same key concurrently — the lock-outside-IO
+	// change must not deadlock or panic
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			s.PutObject("b", "race.txt", strings.NewReader("write"), nil)
+		}()
+		go func() {
+			defer wg.Done()
+			s.DeleteObject("b", "race.txt")
+		}()
+	}
+	wg.Wait()
+	// If we get here without deadlock or panic, the test passes
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

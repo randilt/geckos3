@@ -3,8 +3,10 @@ package main
 import (
 	"crypto/md5"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"io"
@@ -23,8 +25,16 @@ const MaxScanLimit = 100000
 // multipartStagingDir is the hidden directory used for multipart upload staging.
 const multipartStagingDir = ".geckos3-multipart"
 
+// tmpStagingDir is the hidden directory used for temporary file staging.
+// Temp files are written here to avoid races with DeleteObject cleanup.
+const tmpStagingDir = ".geckos3-tmp"
+
 // lockStripes is the number of mutexes in the lock-striping array.
 const lockStripes = 256
+
+// ErrBadDigest is returned when the SHA256 hash of the uploaded content
+// does not match the expected hash provided in the request.
+var ErrBadDigest = errors.New("the Content-SHA256 you specified did not match what we received")
 
 // Storage defines the interface for bucket/object operations.
 type Storage interface {
@@ -84,6 +94,7 @@ type PutObjectInput struct {
 	ContentDisposition string
 	CacheControl       string
 	CustomMetadata     map[string]string
+	ExpectedSHA256     string // If set, verify content hash before committing
 }
 
 // CompletedPart represents a single part in a CompleteMultipartUpload request.
@@ -199,9 +210,16 @@ func (fs *FilesystemStorage) DeleteBucket(bucket string) error {
 		return err
 	}
 
-	// A bucket is empty if it contains nothing besides multipart staging
+	// A bucket is empty if it contains nothing besides internal hidden directories
+	// and common OS artifacts.
+	hiddenEntries := map[string]bool{
+		multipartStagingDir: true,
+		tmpStagingDir:       true,
+		".DS_Store":         true,
+		"Thumbs.db":         true,
+	}
 	for _, entry := range entries {
-		if entry.Name() != multipartStagingDir {
+		if !hiddenEntries[entry.Name()] {
 			return fmt.Errorf("bucket not empty")
 		}
 	}
@@ -252,8 +270,8 @@ func (fs *FilesystemStorage) ListObjects(bucket, prefix string, maxKeys int) ([]
 			return err
 		}
 
-		// Skip the multipart staging directory entirely
-		if d.IsDir() && d.Name() == multipartStagingDir {
+		// Skip internal staging directories entirely
+		if d.IsDir() && (d.Name() == multipartStagingDir || d.Name() == tmpStagingDir) {
 			return filepath.SkipDir
 		}
 
@@ -336,40 +354,39 @@ func (fs *FilesystemStorage) PutObject(bucket, key string, reader io.Reader, inp
 		return nil, err
 	}
 	objectPath := fs.objectPath(bucket, key)
+	bucketPath := filepath.Join(fs.dataDir, bucket)
 
-	// Lock striping: hash the object path to select a stripe mutex.
-	// This is race-free: the stripe array is fixed-size and never deallocated.
-	mu := fs.stripe(objectPath)
-	mu.Lock()
-	defer mu.Unlock()
-
-	// Create parent directories with retry to handle races with DeleteObject cleanup
-	dir := filepath.Dir(objectPath)
-	var mkdirErr error
-	for attempt := 0; attempt < 3; attempt++ {
-		mkdirErr = os.MkdirAll(dir, 0755)
-		if mkdirErr == nil {
-			break
-		}
-		if attempt < 2 {
-			time.Sleep(10 * time.Millisecond)
-		}
-	}
-	if mkdirErr != nil {
-		return nil, mkdirErr
+	// Stage temp files in a dedicated hidden directory to avoid races
+	// with DeleteObject empty-directory cleanup.
+	stagingDir := filepath.Join(bucketPath, tmpStagingDir)
+	if err := os.MkdirAll(stagingDir, 0755); err != nil {
+		return nil, err
 	}
 
-	// Write to unique temporary file to avoid partial writes
-	tempFile, err := os.CreateTemp(dir, ".geckos3-tmp-*")
+	// Write to temp file OUTSIDE the stripe lock — network I/O must not
+	// hold a mutex because clients may be slow or large uploads take time.
+	tempFile, err := os.CreateTemp(stagingDir, ".put-*")
 	if err != nil {
 		return nil, err
 	}
 	tempPath := tempFile.Name()
 
-	// Stream data and calculate MD5
-	hash := md5.New()
-	multiWriter := io.MultiWriter(tempFile, hash)
+	// Stream data and calculate MD5 (+ optional SHA256)
+	md5Hash := md5.New()
+	writers := []io.Writer{tempFile, md5Hash}
 
+	var sha256Hasher io.Writer
+	var sha256Sum func() []byte
+	var expectedSHA string
+	if input != nil && input.ExpectedSHA256 != "" {
+		expectedSHA = input.ExpectedSHA256
+		h := sha256.New()
+		sha256Hasher = h
+		sha256Sum = func() []byte { return h.Sum(nil) }
+		writers = append(writers, h)
+	}
+
+	multiWriter := io.MultiWriter(writers...)
 	size, err := io.Copy(multiWriter, reader)
 	if err != nil {
 		tempFile.Close()
@@ -382,20 +399,39 @@ func (fs *FilesystemStorage) PutObject(bucket, key string, reader io.Reader, inp
 		os.Remove(tempPath)
 		return nil, err
 	}
-
 	if err := tempFile.Close(); err != nil {
 		os.Remove(tempPath)
 		return nil, err
 	}
 
-	// Atomic rename
-	if err := os.Rename(tempPath, objectPath); err != nil {
+	// Verify SHA256 BEFORE committing — never overwrite valid data with
+	// mismatched content.
+	if sha256Hasher != nil {
+		computed := hex.EncodeToString(sha256Sum())
+		if computed != expectedSHA {
+			os.Remove(tempPath)
+			return nil, ErrBadDigest
+		}
+	}
+
+	// Lock only for the directory creation + atomic rename.
+	mu := fs.stripe(objectPath)
+	mu.Lock()
+	dir := filepath.Dir(objectPath)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		mu.Unlock()
 		os.Remove(tempPath)
 		return nil, err
 	}
+	if err := os.Rename(tempPath, objectPath); err != nil {
+		mu.Unlock()
+		os.Remove(tempPath)
+		return nil, err
+	}
+	mu.Unlock()
 
 	// Build metadata from input
-	etag := fmt.Sprintf("\"%s\"", hex.EncodeToString(hash.Sum(nil)))
+	etag := fmt.Sprintf("\"%s\"", hex.EncodeToString(md5Hash.Sum(nil)))
 	contentType := "application/octet-stream"
 	var contentEncoding, contentDisposition, cacheControl string
 	var customMeta map[string]string
@@ -626,23 +662,22 @@ func (fs *FilesystemStorage) CompleteMultipartUpload(bucket, key, uploadID strin
 	}
 
 	objectPath := fs.objectPath(bucket, key)
+	bucketPath := filepath.Join(fs.dataDir, bucket)
 
-	mu := fs.stripe(objectPath)
-	mu.Lock()
-	defer mu.Unlock()
-
-	dir := filepath.Dir(objectPath)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	// Stage temp file in the dedicated hidden directory.
+	tmpDir := filepath.Join(bucketPath, tmpStagingDir)
+	if err := os.MkdirAll(tmpDir, 0755); err != nil {
 		return nil, err
 	}
 
-	tempFile, err := os.CreateTemp(dir, ".geckos3-tmp-*")
+	// Concatenate parts OUTSIDE the stripe lock — local disk I/O for
+	// large multipart objects should never block other writers.
+	tempFile, err := os.CreateTemp(tmpDir, ".complete-*")
 	if err != nil {
 		return nil, err
 	}
 	tempPath := tempFile.Name()
 
-	// Concatenate parts in order while computing combined MD5
 	hash := md5.New()
 	multiWriter := io.MultiWriter(tempFile, hash)
 	var totalSize int64
@@ -675,10 +710,21 @@ func (fs *FilesystemStorage) CompleteMultipartUpload(bucket, key, uploadID strin
 		return nil, err
 	}
 
-	if err := os.Rename(tempPath, objectPath); err != nil {
+	// Lock only for directory creation + atomic rename.
+	mu := fs.stripe(objectPath)
+	mu.Lock()
+	dir := filepath.Dir(objectPath)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		mu.Unlock()
 		os.Remove(tempPath)
 		return nil, err
 	}
+	if err := os.Rename(tempPath, objectPath); err != nil {
+		mu.Unlock()
+		os.Remove(tempPath)
+		return nil, err
+	}
+	mu.Unlock()
 
 	// Build S3-style multipart ETag: MD5-of-data + "-N"
 	etag := fmt.Sprintf("\"%s-%d\"", hex.EncodeToString(hash.Sum(nil)), len(parts))

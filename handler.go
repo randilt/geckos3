@@ -2,12 +2,10 @@ package main
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/xml"
+	"errors"
 	"fmt"
-	"hash"
 	"io"
 	"net/http"
 	"sort"
@@ -212,8 +210,8 @@ func (h *S3Handler) handleListObjectsV2(w http.ResponseWriter, r *http.Request, 
 			maxKeys = parsed
 		}
 	}
-	if maxKeys > 10000 {
-		maxKeys = 10000
+	if maxKeys > 1000 {
+		maxKeys = 1000
 	}
 
 	startKey := startAfter
@@ -347,31 +345,21 @@ func (h *S3Handler) handlePutObject(w http.ResponseWriter, r *http.Request, buck
 		input.CustomMetadata = customMeta
 	}
 
-	// Payload hash verification: if the client sent a real SHA256 (not UNSIGNED-PAYLOAD),
-	// wrap the body in a TeeReader to compute the digest on-the-fly.
-	var bodyReader io.Reader = r.Body
-	var sha256Hasher hash.Hash
+	// Pass SHA256 expectation to storage layer for atomic verification.
+	// The storage layer will verify the hash before committing the file.
 	expectedSHA := r.Header.Get("X-Amz-Content-Sha256")
 	if expectedSHA != "" && expectedSHA != "UNSIGNED-PAYLOAD" && expectedSHA != "STREAMING-AWS4-HMAC-SHA256-PAYLOAD" {
-		sha256Hasher = sha256.New()
-		bodyReader = io.TeeReader(r.Body, sha256Hasher)
+		input.ExpectedSHA256 = expectedSHA
 	}
 
-	metadata, err := h.storage.PutObject(bucket, key, bodyReader, input)
+	metadata, err := h.storage.PutObject(bucket, key, r.Body, input)
 	if err != nil {
-		h.writeError(w, r, "InternalError", err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	// Verify SHA256 if we computed it
-	if sha256Hasher != nil {
-		computed := hex.EncodeToString(sha256Hasher.Sum(nil))
-		if computed != expectedSHA {
-			// Payload mismatch: the file was already written, remove it
-			h.storage.DeleteObject(bucket, key)
+		if errors.Is(err, ErrBadDigest) {
 			h.writeError(w, r, "BadDigest", "The Content-SHA256 you specified did not match what we received", http.StatusBadRequest)
 			return
 		}
+		h.writeError(w, r, "InternalError", err.Error(), http.StatusInternalServerError)
+		return
 	}
 
 	w.Header().Set("ETag", metadata.ETag)
@@ -518,8 +506,8 @@ func (h *S3Handler) handleListObjectsV1(w http.ResponseWriter, r *http.Request, 
 			maxKeys = parsed
 		}
 	}
-	if maxKeys > 10000 {
-		maxKeys = 10000
+	if maxKeys > 1000 {
+		maxKeys = 1000
 	}
 
 	objects, err := h.storage.ListObjects(bucket, prefix, 0)

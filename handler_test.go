@@ -9,6 +9,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -1810,5 +1812,367 @@ func TestHTTPPostObjectWithoutUploadsOrUploadId(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != 501 {
 		t.Errorf("POST without multipart params: expected 501, got %d", resp.StatusCode)
+	}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Fix 2: SHA256 Non-Destructive Verification – Handler Layer
+// ═══════════════════════════════════════════════════════════════════════════════
+
+func TestHTTPSHA256WrongHashPreservesExistingObject(t *testing.T) {
+	srv, _ := setupTestServer(t)
+	mustDo(t, "PUT", srv.URL+"/mybucket", nil, nil).Body.Close()
+
+	// Write a valid object first
+	resp := mustDo(t, "PUT", srv.URL+"/mybucket/preserve.txt",
+		strings.NewReader("original"), nil)
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("initial put: %d", resp.StatusCode)
+	}
+
+	// Try to overwrite with wrong SHA256
+	wrongHash := hex.EncodeToString(sha256.New().Sum(nil))
+	resp2 := mustDo(t, "PUT", srv.URL+"/mybucket/preserve.txt",
+		strings.NewReader("bad payload"), map[string]string{
+			"X-Amz-Content-Sha256": wrongHash,
+		})
+	body2 := readBody(t, resp2)
+	if resp2.StatusCode != 400 {
+		t.Fatalf("bad digest: expected 400, got %d, body: %s", resp2.StatusCode, body2)
+	}
+	if !strings.Contains(body2, "BadDigest") {
+		t.Errorf("expected BadDigest error code, got: %s", body2)
+	}
+
+	// Original object must survive
+	getResp := mustDo(t, "GET", srv.URL+"/mybucket/preserve.txt", nil, nil)
+	content := readBody(t, getResp)
+	if content != "original" {
+		t.Errorf("original content should survive bad-digest overwrite attempt: got %q", content)
+	}
+}
+
+func TestHTTPSHA256BadDigestErrorFormat(t *testing.T) {
+	srv, _ := setupTestServer(t)
+	mustDo(t, "PUT", srv.URL+"/mybucket", nil, nil).Body.Close()
+
+	wrongHash := hex.EncodeToString(sha256.New().Sum(nil))
+	resp := mustDo(t, "PUT", srv.URL+"/mybucket/errfmt.txt",
+		strings.NewReader("content"), map[string]string{
+			"X-Amz-Content-Sha256": wrongHash,
+		})
+	body := readBody(t, resp)
+	if resp.StatusCode != 400 {
+		t.Fatalf("expected 400, got %d", resp.StatusCode)
+	}
+
+	// Response should be valid XML with BadDigest error code
+	var errResp ErrorResponse
+	if err := xml.Unmarshal([]byte(body), &errResp); err != nil {
+		t.Fatalf("response should be valid XML: %v", err)
+	}
+	if errResp.Code != "BadDigest" {
+		t.Errorf("error code: expected BadDigest, got %q", errResp.Code)
+	}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Fix 4: CORS Middleware
+// ═══════════════════════════════════════════════════════════════════════════════
+
+func setupCORSServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	dir := t.TempDir()
+	storage := NewFilesystemStorage(dir)
+	handler := NewS3Handler(storage, &NoOpAuthenticator{})
+	// Wrap with CORS middleware just like main.go does
+	corsHandler := CORSMiddleware(handler)
+	server := httptest.NewServer(corsHandler)
+	t.Cleanup(func() { server.Close() })
+	return server
+}
+
+func TestCORSHeadersOnGET(t *testing.T) {
+	srv := setupCORSServer(t)
+
+	resp := mustDo(t, "GET", srv.URL+"/health", nil, nil)
+	resp.Body.Close()
+
+	if resp.Header.Get("Access-Control-Allow-Origin") == "" {
+		t.Error("CORS: missing Access-Control-Allow-Origin")
+	}
+	if resp.Header.Get("Access-Control-Allow-Methods") == "" {
+		t.Error("CORS: missing Access-Control-Allow-Methods")
+	}
+	if resp.Header.Get("Access-Control-Allow-Headers") == "" {
+		t.Error("CORS: missing Access-Control-Allow-Headers")
+	}
+	if resp.Header.Get("Access-Control-Expose-Headers") == "" {
+		t.Error("CORS: missing Access-Control-Expose-Headers")
+	}
+}
+
+func TestCORSPreflightOPTIONS(t *testing.T) {
+	srv := setupCORSServer(t)
+
+	req, _ := http.NewRequest("OPTIONS", srv.URL+"/mybucket/test.txt", nil)
+	req.Header.Set("Origin", "https://example.com")
+	req.Header.Set("Access-Control-Request-Method", "PUT")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		t.Errorf("OPTIONS preflight: expected 200, got %d", resp.StatusCode)
+	}
+	if resp.Header.Get("Access-Control-Allow-Origin") != "https://example.com" {
+		t.Errorf("CORS origin: expected https://example.com, got %q",
+			resp.Header.Get("Access-Control-Allow-Origin"))
+	}
+	if resp.Header.Get("Access-Control-Max-Age") != "3600" {
+		t.Errorf("CORS max-age: %q", resp.Header.Get("Access-Control-Max-Age"))
+	}
+}
+
+func TestCORSPreflightDoesNotReachHandler(t *testing.T) {
+	srv := setupCORSServer(t)
+
+	// OPTIONS on a non-existent bucket should still return 200,
+	// proving it never reaches the S3 handler
+	req, _ := http.NewRequest("OPTIONS", srv.URL+"/nonexistent/key.txt", nil)
+	req.Header.Set("Origin", "https://test.com")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		t.Errorf("OPTIONS should always return 200, got %d", resp.StatusCode)
+	}
+}
+
+func TestCORSDefaultOriginWildcard(t *testing.T) {
+	srv := setupCORSServer(t)
+
+	// Request without Origin header should get *
+	resp := mustDo(t, "GET", srv.URL+"/health", nil, nil)
+	resp.Body.Close()
+
+	origin := resp.Header.Get("Access-Control-Allow-Origin")
+	if origin != "*" {
+		t.Errorf("CORS origin without Origin header: expected *, got %q", origin)
+	}
+}
+
+func TestCORSReflectsRequestOrigin(t *testing.T) {
+	srv := setupCORSServer(t)
+
+	req, _ := http.NewRequest("GET", srv.URL+"/health", nil)
+	req.Header.Set("Origin", "https://my-app.example.com")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	origin := resp.Header.Get("Access-Control-Allow-Origin")
+	if origin != "https://my-app.example.com" {
+		t.Errorf("CORS should reflect Origin header: expected https://my-app.example.com, got %q", origin)
+	}
+}
+
+func TestCORSHeadersOnPUT(t *testing.T) {
+	srv := setupCORSServer(t)
+
+	// Create bucket
+	mustDo(t, "PUT", srv.URL+"/mybucket", nil, nil).Body.Close()
+
+	req, _ := http.NewRequest("PUT", srv.URL+"/mybucket/obj.txt", strings.NewReader("data"))
+	req.Header.Set("Origin", "https://app.dev")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		t.Errorf("PUT: expected 200, got %d", resp.StatusCode)
+	}
+	if resp.Header.Get("Access-Control-Allow-Origin") != "https://app.dev" {
+		t.Errorf("CORS on PUT: %q", resp.Header.Get("Access-Control-Allow-Origin"))
+	}
+}
+
+func TestCORSAllowedMethods(t *testing.T) {
+	srv := setupCORSServer(t)
+
+	resp := mustDo(t, "GET", srv.URL+"/health", nil, nil)
+	resp.Body.Close()
+
+	methods := resp.Header.Get("Access-Control-Allow-Methods")
+	for _, m := range []string{"GET", "PUT", "POST", "DELETE", "HEAD", "OPTIONS"} {
+		if !strings.Contains(methods, m) {
+			t.Errorf("CORS allowed methods should include %s, got: %s", m, methods)
+		}
+	}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Fix 6: MaxKeys Pagination Cap at 1000
+// ═══════════════════════════════════════════════════════════════════════════════
+
+func TestListObjectsV2MaxKeysCappedAt1000(t *testing.T) {
+	srv, _ := setupTestServer(t)
+	mustDo(t, "PUT", srv.URL+"/mybucket", nil, nil).Body.Close()
+
+	// Request max-keys=5000 — should be capped to 1000
+	resp := mustDo(t, "GET", srv.URL+"/mybucket?list-type=2&max-keys=5000", nil, nil)
+	body := readBody(t, resp)
+
+	var result ListBucketResult
+	xml.Unmarshal([]byte(body), &result)
+	if result.MaxKeys != 1000 {
+		t.Errorf("V2 MaxKeys should be capped at 1000, got %d", result.MaxKeys)
+	}
+}
+
+func TestListObjectsV1MaxKeysCappedAt1000(t *testing.T) {
+	srv, _ := setupTestServer(t)
+	mustDo(t, "PUT", srv.URL+"/mybucket", nil, nil).Body.Close()
+
+	// V1 listing with max-keys=9999
+	resp := mustDo(t, "GET", srv.URL+"/mybucket?max-keys=9999", nil, nil)
+	body := readBody(t, resp)
+
+	var result ListBucketResultV1
+	xml.Unmarshal([]byte(body), &result)
+	if result.MaxKeys != 1000 {
+		t.Errorf("V1 MaxKeys should be capped at 1000, got %d", result.MaxKeys)
+	}
+}
+
+func TestListObjectsMaxKeysExact1000Allowed(t *testing.T) {
+	srv, _ := setupTestServer(t)
+	mustDo(t, "PUT", srv.URL+"/mybucket", nil, nil).Body.Close()
+
+	resp := mustDo(t, "GET", srv.URL+"/mybucket?list-type=2&max-keys=1000", nil, nil)
+	body := readBody(t, resp)
+
+	var result ListBucketResult
+	xml.Unmarshal([]byte(body), &result)
+	if result.MaxKeys != 1000 {
+		t.Errorf("MaxKeys=1000 should pass through unchanged, got %d", result.MaxKeys)
+	}
+}
+
+func TestListObjectsMaxKeysBelow1000PassesThrough(t *testing.T) {
+	srv, _ := setupTestServer(t)
+	mustDo(t, "PUT", srv.URL+"/mybucket", nil, nil).Body.Close()
+
+	resp := mustDo(t, "GET", srv.URL+"/mybucket?list-type=2&max-keys=50", nil, nil)
+	body := readBody(t, resp)
+
+	var result ListBucketResult
+	xml.Unmarshal([]byte(body), &result)
+	if result.MaxKeys != 50 {
+		t.Errorf("MaxKeys=50 should pass through unchanged, got %d", result.MaxKeys)
+	}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Fix 3: Temp Staging Dir in Handler E2E
+// ═══════════════════════════════════════════════════════════════════════════════
+
+func TestHTTPPutDoesNotLeaveTmpInListing(t *testing.T) {
+	srv, _ := setupTestServer(t)
+	mustDo(t, "PUT", srv.URL+"/mybucket", nil, nil).Body.Close()
+
+	// Upload several objects
+	for i := 0; i < 5; i++ {
+		key := fmt.Sprintf("obj-%d.txt", i)
+		mustDo(t, "PUT", srv.URL+"/mybucket/"+key,
+			strings.NewReader("data"), nil).Body.Close()
+	}
+
+	// List all objects — .geckos3-tmp must not appear
+	resp := mustDo(t, "GET", srv.URL+"/mybucket?list-type=2", nil, nil)
+	body := readBody(t, resp)
+
+	if strings.Contains(body, ".geckos3-tmp") {
+		t.Error(".geckos3-tmp should never appear in object listings")
+	}
+
+	var result ListBucketResult
+	xml.Unmarshal([]byte(body), &result)
+	if result.KeyCount != 5 {
+		t.Errorf("expected 5 objects, got %d", result.KeyCount)
+	}
+}
+
+func TestHTTPMultipartCompleteTmpNotInListing(t *testing.T) {
+	srv, _ := setupTestServer(t)
+	mustDo(t, "PUT", srv.URL+"/mybucket", nil, nil).Body.Close()
+
+	// Multipart upload
+	resp := mustDo(t, "POST", srv.URL+"/mybucket/mp.txt?uploads", nil, nil)
+	body := readBody(t, resp)
+	var initResult InitiateMultipartUploadResult
+	xml.Unmarshal([]byte(body), &initResult)
+	uploadID := initResult.UploadId
+
+	partResp := mustDo(t, "PUT",
+		fmt.Sprintf("%s/mybucket/mp.txt?partNumber=1&uploadId=%s", srv.URL, uploadID),
+		strings.NewReader("multipart content"), nil)
+	etag := partResp.Header.Get("ETag")
+	partResp.Body.Close()
+
+	completeXML := fmt.Sprintf(
+		`<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>%s</ETag></Part></CompleteMultipartUpload>`, etag)
+	mustDo(t, "POST",
+		fmt.Sprintf("%s/mybucket/mp.txt?uploadId=%s", srv.URL, uploadID),
+		strings.NewReader(completeXML), nil).Body.Close()
+
+	// List — should only see mp.txt, no staging dirs
+	listResp := mustDo(t, "GET", srv.URL+"/mybucket?list-type=2", nil, nil)
+	listBody := readBody(t, listResp)
+
+	if strings.Contains(listBody, ".geckos3-tmp") {
+		t.Error(".geckos3-tmp should not appear in listing after multipart complete")
+	}
+	if strings.Contains(listBody, ".geckos3-multipart") {
+		t.Error(".geckos3-multipart should not appear in listing")
+	}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Fix 5: DeleteBucket with Artifacts via HTTP
+// ═══════════════════════════════════════════════════════════════════════════════
+
+func TestHTTPDeleteBucketWithArtifacts(t *testing.T) {
+	srv, storage := setupTestServer(t)
+
+	// Create bucket via API
+	mustDo(t, "PUT", srv.URL+"/mybucket", nil, nil).Body.Close()
+
+	// Manually place OS artifacts that would block old DeleteBucket
+	os.WriteFile(filepath.Join(storage.dataDir, "mybucket", ".DS_Store"), []byte("x"), 0644)
+	os.WriteFile(filepath.Join(storage.dataDir, "mybucket", "Thumbs.db"), []byte("x"), 0644)
+
+	// Delete should succeed
+	resp := mustDo(t, "DELETE", srv.URL+"/mybucket", nil, nil)
+	resp.Body.Close()
+	if resp.StatusCode != 204 {
+		t.Errorf("DeleteBucket with artifacts: expected 204, got %d", resp.StatusCode)
+	}
+
+	// Verify bucket is gone
+	headResp := mustDo(t, "HEAD", srv.URL+"/mybucket", nil, nil)
+	headResp.Body.Close()
+	if headResp.StatusCode != 404 {
+		t.Errorf("bucket should be gone: got %d", headResp.StatusCode)
 	}
 }
