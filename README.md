@@ -4,7 +4,6 @@
 [![Docker Pulls](https://img.shields.io/docker/pulls/randiltharusha/geckos3)](https://hub.docker.com/r/randiltharusha/geckos3)
 [![Go Version](https://img.shields.io/github/go-mod/go-version/randilt/geckos3)](https://go.dev/)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-[![Go Report Card](https://goreportcard.com/badge/github.com/randilt/geckos3)](https://goreportcard.com/report/github.com/randilt/geckos3)
 
 A lightweight S3-compatible object storage server that maps buckets to directories and objects to files on the local filesystem. Single binary, zero dependencies, pure Go.
 
